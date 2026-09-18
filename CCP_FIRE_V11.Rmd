@@ -1,0 +1,3983 @@
+---
+title: "Fire-driven forest loss in the central Congo Basin peatland complex, 2001-2025"
+author: "Armel Landry Batchi-Bouyou"
+date: "`r format(Sys.Date())`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    number_sections: true
+    df_print: paged
+---
+
+<!--
+============================================================================
+CCP_FIRE_V11.Rmd
+
+V11 fixes two execution issues encountered after V10 successfully completed the
+nearest-neighbour distance stages. First, RStudio's interactive chunk runner
+repeatedly tried to evaluate chunk-header expressions such as
+`eval=cfg$use_chirps` in an environment where `cfg` was not visible, producing
+spurious `object 'cfg' not found` errors even though the chunk bodies continued
+to run. V11 removes configuration expressions from chunk headers and performs
+the same conditions inside ordinary R code. Second, the GeoTIFF export used
+base `pmax()` on a terra SpatRaster, which is not a supported raster operation
+and failed with `invalid 'x' type in 'x || y'`. V11 replaces that denominator
+with a terra-native `ifel()` operation. Scientific definitions, the 100 m
+distance densification, the RANN/FNN/nabor functional backend preflight, the
+0.05 degree analysis grid, and all outputs are unchanged.
+
+V10 fixes the nearest-neighbour backend failure encountered in V9.
+  V9 selected nabor solely because it was installed and called the Rcpp-module
+  WKNND$query method without its documented radius argument. On this machine
+  that method dispatch failed only after 1,776,213 road reference vertices had
+  already been generated. V10 performs a tiny functional self-test before any
+  expensive spatial processing, prefers RANN and then FNN, and uses nabor only
+  as a tested fallback with the complete query signature (including radius=0).
+  Every backend is normalised to return the same plain integer index matrix.
+  The road query releases the k-d-tree/reference metric copy as soon as the
+  neighbour indices have been obtained, and the peat-edge workflow uses the
+  same centrally tested backend. The 100 m densification and scientific
+  definitions are unchanged.
+
+V9 removes an optional sf dependency that is not installed on this machine.
+  sf::st_segmentize() on geographic coordinates dispatches to lwgeom, which
+  needs liblwgeom and errored with "package lwgeom required". The line
+  densification is now done directly on the coordinate matrix by linear
+  interpolation in lon/lat. Over segments capped at 100 m that is
+  indistinguishable from geodesic interpolation, and it needs nothing beyond
+  sf and base R. Nothing else changed.
+
+V8 fixed a regression introduced in V7 and removes a multi-hour bottleneck.
+
+  1  The stronger cache check added in V7 called terra::readValues() without
+     terra::readStart(). Every cached product therefore reported
+     "[readValues] the file is not open for reading", was declared invalid,
+     and was rebuilt; worse, discard_if_invalid() then deleted correct files.
+     readStart/readStop are now used, and the deletion path only removes a
+     file that is absent, implausibly small, or impossible to open. A layer
+     or geometry mismatch is reported and the file is left alone, because the
+     rebuild overwrites it anyway.
+
+  2  The vector distance rasters now use a densify-plus-k-d-tree method by
+     default. terra::distance() against a 63,000 feature road layer is
+     roughly cells times features geodesic segment tests and runs for hours;
+     the new method takes seconds. Its maximum absolute error is half the
+     densification interval, 50 m at the default, on a covariate measured in
+     kilometres over 5.5 km cells. Set cfg$distance_method = "exact" to use
+     the strip-wise terra path instead. A sidecar .method file records how
+     each cached raster was built so the four covariates can never end up
+     mixing definitions.
+
+  3  sweep_temp() no longer calls terra::tmpFiles(), which could not work
+     with a custom tempdir and emitted a warning at every stage.
+
+V7 fixed a fatal native crash and keeps every V6 memory protection.
+
+The crash
+  V6 aborted the whole R session, not with an R error but with a native
+  abort, at "building the peat edge distance raster at 100 m". The cause is
+  terra::distance(x) applied to a SpatRaster whose non-NA cells are the
+  targets. That form of the function is not a chunked operation. terra has to
+  hold the entire grid, plus its working structures, in RAM at once, and it
+  builds them in C++ before anything is written, so the filename argument
+  cannot help. The 100 m domain is about 7,700 by 10,100 cells, roughly 78
+  million, and the target set is the whole peat boundary. On an 8 GB machine
+  the allocation fails inside C++, and an unhandled allocation failure
+  terminates the process. try() and tryCatch() operate at the R level and
+  never get a chance to run, which is exactly what was observed.
+
+What V7 does instead
+  The same variable is computed by an exact streaming nearest-neighbour
+  method that never holds more than one horizontal slab of the 100 m grid:
+    1  one streaming pass over the CongoPeat raster with a one row halo
+       extracts the coordinates of every inner boundary cell of the peat
+       swamp forest class, using an 8-connected test identical to
+       terra::boundaries(inner = TRUE, directions = 8)
+    2  those edge coordinates go into a k-d tree
+    3  a second pass walks the 100 m grid slab by slab, finds the nearest
+       edge points for every cell, and converts to true geodesic metres
+    4  the analysis grid mean is accumulated during the same pass
+  No step ever allocates a full domain array in C++, and there is no longer
+  any code path that attempts the dangerous full-domain terra::distance().
+
+  The four vector distance rasters (roads, major roads, rivers, settlements)
+  and the ones built for the grid-size robustness analysis are now computed
+  in horizontal strips and written straight to disk, so no single terra call
+  sees the whole grid.
+
+  Cached products are validated against CRS, extent, resolution, layer count,
+  readable values and a plausible file size before reuse, and any file that
+  fails is deleted and rebuilt rather than trusted.
+
+Everything from V6 is preserved: memfrac 0.35, the scratch directory at
+~/terra_tmp_ccp outside the project and outside cloud storage, disk-backed
+Hansen processing through a VRT, the streaming count engine, cached reusable
+products in data/processed/, targeted rm() and gc(), no parallelism, the
+restartable design, the progress messages, the directory layout, and the
+400 dpi PNG plus PDF publication outputs.
+
+The science is unchanged. See the note on d_peat_edge_km in the peat edge
+section for the one implementation detail worth recording in the methods.
+
+V6 was a memory-optimised rewrite of V5 for an 8 GB Apple Silicon Mac.
+The science is unchanged: same domain, same 0.00025 degree analytical
+resolution, same 0.05 degree analysis grid, same years, same variables,
+same models, same robustness analyses, same outputs. Only the execution
+strategy changed.
+
+What changed, and why
+  1  terra memfrac lowered to 0.35 and the terra scratch directory moved to
+     ~/terra_tmp_ccp on the internal SSD, outside the project and outside
+     any cloud-synchronised folder. A startup guard refuses to run if the
+     scratch path resolves inside the project or a known cloud folder.
+  2  Hansen and fire mosaics are assembled through a GDAL VRT rather than by
+     reading tiles into terra. A VRT copies no pixels, so four 600 MB tiles
+     never coexist in RAM. Crop and mask are then streamed straight to a
+     compressed file.
+  3  The single largest change: grid counts and the 2001-2025 annual counts
+     are produced by one streaming block pass over the 30 m grid instead of
+     roughly one hundred whole-raster terra passes. V5 built five- and
+     four-layer stacks of derived 986-million-cell rasters, each of which
+     terra materialised as an uncompressed double-precision temporary file.
+     That is what filled RAM and filled terra_tmp. The block engine reads
+     100 raster rows at a time, tabulates every year and every metric from
+     that slab, and keeps only small accumulator arrays. Peak RAM for this
+     stage is a few hundred MB.
+  4  The block engine is verified against terra::aggregate on an aligned
+     sub-window before it is trusted, and there is an automatic fallback to
+     a year-by-year, file-backed terra path if verification fails.
+  5  The canopy-threshold sensitivity is one streaming pass instead of
+     twelve whole-raster passes, using exact per-row geodesic pixel areas.
+  6  The stratified validation sample no longer calls terra::cells() on a
+     986-million-cell mask, which would have returned hundreds of millions
+     of cell indices. It uses probability-proportional-to-size selection of
+     analysis cells followed by uniform selection inside the chosen cell,
+     which is uniform over the stratum and reads only small windows.
+  7  Distance rasters, OSM subsets, the peat class frequency table and every
+     expensive intermediate are cached in data/processed/ and validated
+     before reuse.
+  8  Large data frames are released as soon as the last chunk that needs
+     them has run. Every rm() was checked against downstream chunks.
+  9  Every figure and every map is written as 400 dpi PNG and as PDF,
+     directly into outputs/figures/ and outputs/maps/.
+
+Directory layout is unchanged:
+  ccp_fire/data/{raw,processed,manual_inputs}
+  ccp_fire/outputs/{tables,figures,maps,geotiff,diagnostics}
+Disposable terra scratch files live outside the project, in ~/terra_tmp_ccp.
+
+Purpose
+  Quantify how much of the mapped forest loss in the central Congo Basin
+  peatland complex (Republic of the Congo and Democratic Republic of the
+  Congo) between 2001 and 2025 was attributable to fire, test whether the
+  fire-attributed share rose in 2023-2025, and identify where fire-driven
+  loss is concentrated relative to peat swamp forest, protected areas,
+  roads, rivers, settlements and rainfall deficit.
+
+Design
+  Unit of analysis  : 0.05 degree grid cell (about 5.5 km)
+  Outcome           : count of 30 m forest-loss pixels attributed to fire
+  Contrast outcome  : count of 30 m forest-loss pixels not attributed to fire
+  Exposure          : peat swamp forest fraction, access, protection, rainfall
+  Models            : negative binomial GLM with log(baseline forest) offset
+============================================================================
+-->
+
+```{r knitr-setup, include=FALSE}
+knitr::opts_chunk$set(
+  echo = TRUE, message = TRUE, warning = TRUE,
+  cache = FALSE, fig.width = 8, fig.height = 5, dpi = 150
+)
+```
+
+# Configuration
+
+```{r config}
+# ---------------------------------------------------------------------------
+# Project configuration
+# ---------------------------------------------------------------------------
+
+cfg <- list(
+
+  # Root directory. All inputs and outputs live below this.
+  root_dir = "ccp_fire",
+
+  # Include the DRC part of the peatland complex.
+  include_drc = TRUE,
+
+  # Study domain definition.
+  # "peat_buffer" = mapped peat swamp forest plus a buffer (recommended)
+  # "bbox"        = the whole CongoPeat footprint
+  domain_mode      = "peat_buffer",
+  domain_buffer_km = 50,
+
+  # Analysis grid cell size in degrees. 0.05 deg is about 5.5 km at the equator
+  # and divides the Hansen 0.00025 deg grid exactly (factor 200).
+  grid_deg = 0.05,
+
+  # Baseline forest definition: minimum Hansen tree canopy cover in 2000 (%).
+  forest_thresh = 30,
+
+  # Sensitivity thresholds for the same quantity.
+  forest_thresh_sens = c(10, 30, 50),
+
+  # CongoPeat simplified map class codes.
+  # 1 open water, 2 savanna, 3 other tropical forest (terra firme),
+  # 4 peat swamp forest
+  peat_class        = 4L,
+  forest_classes    = c(3L, 4L),
+
+  # Analysis windows.
+  year_min      = 2001L,
+  year_max      = 2025L,
+  recent_window = c(2023L, 2025L),   # the anomaly window
+  base_window   = c(2001L, 2022L),   # the reference window
+
+  # Rainfall covariate.
+  use_chirps   = TRUE,
+  chirps_years = 2001:2025,
+
+  # Hansen treecover2000, needed for the canopy-threshold sensitivity.
+  download_treecover2000 = TRUE,
+
+  # Stratified validation points per stratum. Set to 0 to skip.
+  n_validation_per_stratum = 100L,
+
+  # Random seed.
+  seed = 20260908L,
+
+  # Alternative grid sizes used in the robustness analysis.
+  grid_deg_sens = c(0.025, 0.05, 0.1),
+
+  # ---- memory and execution settings, new in V6 --------------------------
+
+  # Fraction of RAM terra may use. 0.35 on an 8 GB machine leaves headroom
+  # for R, RStudio and macOS. Reliability matters more than speed here.
+  terra_memfrac = 0.35,
+
+  # Disposable terra scratch directory. Must be on the internal SSD and must
+  # not be inside the project or any cloud-synchronised folder.
+  terra_tmp_dir = path.expand("~/terra_tmp_ccp"),
+
+  # Raster rows read per slab in the streaming block engine. 100 rows of a
+  # 36000 column raster is about 29 MB per layer, four layers per read.
+  block_rows_target = 100L,
+
+  # Verify the block engine against terra::aggregate on an aligned window
+  # before trusting it. Cheap, and it catches any indexing error.
+  verify_block_engine = TRUE,
+  verify_window_cells = 6L,
+
+  # Remove terra scratch files left by earlier sessions at startup.
+  purge_stale_terra_tmp = TRUE,
+
+  # How the vector distance rasters (roads, rivers, settlements) are computed.
+  # "fast"  = densify the lines to distance_vertex_m, then nearest-vertex
+  #           search with a k-d tree and a geodesic recomputation. Seconds
+  #           per layer. Maximum absolute error is half the densification
+  #           interval, so 50 m at the default, on a covariate measured in
+  #           kilometres over 5.5 km cells.
+  # "exact" = terra::distance() against the full vector, in strips. Exact to
+  #           the segment, but many hours for a 63,000 feature road layer.
+  distance_method   = "fast",
+  distance_vertex_m = 100,
+
+  # Keep the full 100 m peat edge distance raster as a reusable product in
+  # data/processed/. It is about 150 to 300 MB compressed. Set FALSE to
+  # compute the analysis grid covariate without keeping the 100 m layer.
+  write_peat_edge_100m = TRUE
+)
+
+# Derived directories. The layout is unchanged from V5.
+cfg$data_dir    <- file.path(cfg$root_dir, "data")
+cfg$raw_dir     <- file.path(cfg$data_dir, "raw")
+cfg$proc_dir    <- file.path(cfg$data_dir, "processed")
+cfg$out_dir     <- file.path(cfg$root_dir, "outputs")
+cfg$tab_dir     <- file.path(cfg$out_dir, "tables")
+cfg$fig_dir     <- file.path(cfg$out_dir, "figures")
+cfg$map_dir     <- file.path(cfg$out_dir, "maps")
+cfg$tif_dir     <- file.path(cfg$out_dir, "geotiff")
+cfg$diag_dir    <- file.path(cfg$out_dir, "diagnostics")
+cfg$manual_dir  <- file.path(cfg$data_dir, "manual_inputs")
+
+for (d in c(cfg$root_dir, cfg$data_dir, cfg$raw_dir, cfg$proc_dir,
+            cfg$out_dir, cfg$tab_dir, cfg$fig_dir, cfg$map_dir,
+            cfg$tif_dir, cfg$diag_dir, cfg$manual_dir)) {
+  dir.create(d, showWarnings = FALSE, recursive = TRUE)
+}
+
+set.seed(cfg$seed)
+options(timeout = max(7200, getOption("timeout")))
+str(cfg[!names(cfg) %in% c("chirps_years")])
+```
+
+# Packages
+
+```{r packages}
+pkgs <- c(
+  "sf", "terra", "dplyr", "tidyr", "readr", "stringr", "tibble",
+  "ggplot2", "scales", "units", "httr2", "jsonlite",
+  "MASS", "sandwich", "lmtest", "knitr"
+)
+
+to_install <- pkgs[!pkgs %in% rownames(installed.packages())]
+if (length(to_install)) {
+  install.packages(to_install, repos = "https://cloud.r-project.org")
+}
+invisible(lapply(pkgs, library, character.only = TRUE))
+
+# ---------------------------------------------------------------------------
+# Nearest-neighbour backend preflight
+#
+# V9 selected nabor only because it was installed. Its WKNND Rcpp-module query
+# was then called without the documented radius argument and failed after the
+# expensive road densification had already completed. V10 tests the exact
+# build/query path on a tiny matrix before any expensive spatial processing.
+# The preferred order on this Mac is RANN, FNN, then a verified nabor fallback.
+# ---------------------------------------------------------------------------
+
+nn_normalize_indices <- function(idx, nq, k, nref, backend) {
+  nq <- as.integer(nq); k <- as.integer(k); nref <- as.integer(nref)
+
+  # Only coerce ordinary atomic/data-frame outputs. Never dispatch as.matrix()
+  # on an arbitrary backend/Rcpp object.
+  if (is.data.frame(idx)) idx <- as.matrix(idx)
+  if (is.atomic(idx) && is.null(dim(idx))) {
+    if (length(idx) != nq * k) {
+      stop("Nearest-neighbour backend ", backend, " returned ", length(idx),
+           " indices; expected ", nq * k, ".")
+    }
+    idx <- matrix(idx, nrow = nq, ncol = k)
+  } else if (!is.matrix(idx)) {
+    stop("Nearest-neighbour backend ", backend,
+         " returned an unsupported object of class ",
+         paste(class(idx), collapse = "/"), ".")
+  }
+
+  if (!is.numeric(idx) && !is.integer(idx)) {
+    stop("Nearest-neighbour backend ", backend,
+         " did not return numeric/integer indices.")
+  }
+  if (length(dim(idx)) != 2L || any(dim(idx) != c(nq, k))) {
+    if (length(idx) == nq * k) {
+      dim(idx) <- c(nq, k)
+    } else {
+      stop("Nearest-neighbour backend ", backend, " returned dimensions ",
+           paste(dim(idx), collapse = " x "), "; expected ", nq, " x ", k, ".")
+    }
+  }
+  if (anyNA(idx) || any(!is.finite(idx)) || any(idx < 1) || any(idx > nref)) {
+    stop("Nearest-neighbour backend ", backend,
+         " returned missing, non-finite or out-of-range indices.")
+  }
+  storage.mode(idx) <- "integer"
+  idx
+}
+
+nn_index_builder <- function(ref_xy, backend) {
+  if (is.data.frame(ref_xy)) ref_xy <- as.matrix(ref_xy)
+  if (!is.matrix(ref_xy) || ncol(ref_xy) != 2L || !is.numeric(ref_xy)) {
+    stop("Nearest-neighbour reference coordinates must be a numeric two-column matrix.")
+  }
+  storage.mode(ref_xy) <- "double"
+  if (!nrow(ref_xy) || any(!is.finite(ref_xy))) {
+    stop("Nearest-neighbour reference coordinates are empty or non-finite.")
+  }
+  nref <- nrow(ref_xy)
+
+  prepare_query <- function(q, k) {
+    if (is.data.frame(q)) q <- as.matrix(q)
+    if (!is.matrix(q) || ncol(q) != 2L || !is.numeric(q)) {
+      stop("Nearest-neighbour query coordinates must be a numeric two-column matrix.")
+    }
+    storage.mode(q) <- "double"
+    if (!nrow(q) || any(!is.finite(q))) {
+      stop("Nearest-neighbour query coordinates are empty or non-finite.")
+    }
+    kk <- max(1L, min(as.integer(k), nref))
+    list(q = q, k = kk)
+  }
+
+  if (identical(backend, "RANN")) {
+    if (!requireNamespace("RANN", quietly = TRUE)) stop("RANN is not installed.")
+    return(list(
+      backend = "RANN",
+      query = function(q, k) {
+        z <- prepare_query(q, k)
+        raw <- RANN::nn2(data = ref_xy, query = z$q, k = z$k,
+                         treetype = "kd", searchtype = "standard")$nn.idx
+        nn_normalize_indices(raw, nrow(z$q), z$k, nref, "RANN")
+      }
+    ))
+  }
+
+  if (identical(backend, "FNN")) {
+    if (!requireNamespace("FNN", quietly = TRUE)) stop("FNN is not installed.")
+    return(list(
+      backend = "FNN",
+      query = function(q, k) {
+        z <- prepare_query(q, k)
+        raw <- FNN::get.knnx(data = ref_xy, query = z$q, k = z$k,
+                             algorithm = "kd_tree")$nn.index
+        nn_normalize_indices(raw, nrow(z$q), z$k, nref, "FNN")
+      }
+    ))
+  }
+
+  if (identical(backend, "nabor")) {
+    if (!requireNamespace("nabor", quietly = TRUE)) stop("nabor is not installed.")
+    # nabor's documented WKNND query signature is query(query, k, eps, radius).
+    # V9 omitted radius, which can make Rcpp-module method dispatch fail.
+    tr <- nabor::WKNND(ref_xy)
+    return(list(
+      backend = "nabor",
+      query = function(q, k) {
+        z <- prepare_query(q, k)
+        ans <- tr$query(z$q, k = z$k, eps = 0, radius = 0)
+        if (!is.list(ans) || is.null(ans$nn.idx)) {
+          stop("nabor WKNND$query did not return a list containing nn.idx.")
+        }
+        nn_normalize_indices(ans$nn.idx, nrow(z$q), z$k, nref, "nabor")
+      }
+    ))
+  }
+
+  stop("Unsupported nearest-neighbour backend: ", backend)
+}
+
+nn_backend_self_test <- function(backend) {
+  ref <- rbind(c(0, 0), c(10, 0), c(0, 10), c(10, 10), c(5, 5))
+  qry <- rbind(c(0.1, 0.2), c(9.8, 0.1), c(9.9, 9.9))
+  storage.mode(ref) <- "double"
+  storage.mode(qry) <- "double"
+  expected_first <- c(1L, 2L, 4L)
+
+  err <- NULL
+  ok <- tryCatch({
+    nn <- nn_index_builder(ref, backend = backend)
+    idx <- nn$query(qry, 2L)
+    good <- is.matrix(idx) && is.integer(idx) &&
+      all(dim(idx) == c(nrow(qry), 2L)) &&
+      all(idx >= 1L & idx <= nrow(ref)) &&
+      identical(as.integer(idx[, 1]), expected_first)
+    rm(nn, idx); gc()
+    if (!good) stop("returned indices failed the dimension/range/nearest-point checks")
+    TRUE
+  }, error = function(e) {
+    err <<- conditionMessage(e)
+    FALSE
+  })
+
+  if (isTRUE(ok)) {
+    message("Nearest-neighbour backend ", backend, ": OK")
+  } else {
+    message("Nearest-neighbour backend ", backend,
+            ": FAILED functional test (", err, ")")
+  }
+  isTRUE(ok)
+}
+
+select_nn_backend <- function() {
+  # Prefer a plain-function backend on this machine. If neither RANN nor FNN is
+  # installed, try RANN first. If it cannot be installed or fails its functional
+  # test, try FNN. nabor is retained only as an explicitly verified fallback.
+  if (!requireNamespace("RANN", quietly = TRUE) &&
+      !requireNamespace("FNN", quietly = TRUE)) {
+    message("Installing RANN for the nearest-neighbour backend preflight.")
+    try(install.packages("RANN", repos = "https://cloud.r-project.org"), silent = TRUE)
+  }
+
+  if (requireNamespace("RANN", quietly = TRUE) && nn_backend_self_test("RANN")) {
+    return("RANN")
+  }
+
+  if (!requireNamespace("FNN", quietly = TRUE)) {
+    message("RANN is unavailable or failed its self-test; installing FNN.")
+    try(install.packages("FNN", repos = "https://cloud.r-project.org"), silent = TRUE)
+  }
+  if (requireNamespace("FNN", quietly = TRUE) && nn_backend_self_test("FNN")) {
+    return("FNN")
+  }
+
+  if (requireNamespace("nabor", quietly = TRUE) && nn_backend_self_test("nabor")) {
+    message("Using nabor only because its corrected WKNND path passed the functional test.")
+    return("nabor")
+  }
+
+  stop(
+    "No tested nearest-neighbour backend is usable. Try one of:\n",
+    "  install.packages(\"RANN\", repos=\"https://cloud.r-project.org\")\n",
+    "  install.packages(\"FNN\", repos=\"https://cloud.r-project.org\")\n",
+    "Then restart R and rerun the script."
+  )
+}
+
+.nn_backend_selected <- select_nn_backend()
+message("Using nearest-neighbour backend: ", .nn_backend_selected)
+
+# dplyr::select must win over MASS::select
+select <- dplyr::select
+
+sessionInfo()$R.version$version.string
+```
+
+# terra scratch directory and preflight checks
+
+The scratch directory holds disposable terra temporaries only. Reusable
+processed products stay in `data/processed/` and are never deleted here.
+
+```{r terra-setup}
+# ---------------------------------------------------------------------------
+# Locate a safe scratch directory on the internal SSD
+# ---------------------------------------------------------------------------
+
+cloud_markers <- c(
+  "Library/CloudStorage", "Mobile Documents", "com~apple~CloudDocs",
+  "iCloud", "Dropbox", "OneDrive", "Google Drive", "GoogleDrive",
+  "Proton Drive", "ProtonDrive", "pCloud", "Box Sync", "Creative Cloud",
+  "Sync.com", "MEGA", "Nextcloud", "ownCloud"
+)
+
+path_looks_cloudy <- function(p) {
+  pn <- normalizePath(p, winslash = "/", mustWork = FALSE)
+  any(vapply(cloud_markers, function(m) grepl(m, pn, fixed = TRUE), logical(1)))
+}
+
+local_tmp <- cfg$terra_tmp_dir
+dir.create(local_tmp, recursive = TRUE, showWarnings = FALSE)
+if (!dir.exists(local_tmp)) {
+  stop("Could not create the terra scratch directory at ", local_tmp)
+}
+
+local_tmp_norm   <- normalizePath(local_tmp,     winslash = "/", mustWork = TRUE)
+project_norm     <- normalizePath(cfg$root_dir,  winslash = "/", mustWork = TRUE)
+
+if (startsWith(local_tmp_norm, project_norm)) {
+  stop("The terra scratch directory resolves inside the project (", local_tmp_norm,
+       "). Set cfg$terra_tmp_dir to a path outside ", project_norm)
+}
+if (path_looks_cloudy(local_tmp_norm)) {
+  stop("The terra scratch directory looks cloud-synchronised (", local_tmp_norm,
+       "). Set cfg$terra_tmp_dir to a plain local path such as ~/terra_tmp_ccp")
+}
+
+# Write test, because a path can exist and still be read-only or offloaded.
+probe <- file.path(local_tmp_norm, ".write_probe")
+ok_write <- tryCatch({ writeLines("ok", probe); file.exists(probe) },
+                     error = function(e) FALSE)
+unlink(probe)
+if (!isTRUE(ok_write)) stop("The terra scratch directory is not writable: ", local_tmp_norm)
+
+terra::terraOptions(
+  memfrac  = cfg$terra_memfrac,
+  tempdir  = local_tmp_norm,
+  progress = 1
+)
+
+# Confirm terra actually took the setting, rather than assuming it did.
+terra_tmp_actual <- terra::terraOptions(print = FALSE)$tempdir
+message("terra tempdir in use: ", terra_tmp_actual)
+message("terra memfrac in use: ", terra::terraOptions(print = FALSE)$memfrac)
+if (!identical(normalizePath(terra_tmp_actual, winslash = "/", mustWork = FALSE),
+               local_tmp_norm)) {
+  stop("terra did not accept the scratch directory. Requested ", local_tmp_norm,
+       " but terra reports ", terra_tmp_actual)
+}
+
+# Remove scratch files left behind by earlier sessions. Nothing in this
+# session references them yet, so this is safe. Reusable products in
+# data/processed/ are untouched.
+if (isTRUE(cfg$purge_stale_terra_tmp)) {
+  stale <- list.files(local_tmp_norm, pattern = "^spat.*\\.(tif|vrt|json|aux\\.xml)$",
+                      full.names = TRUE)
+  if (length(stale)) {
+    message("Removing ", length(stale), " stale terra scratch files (",
+            round(sum(file.info(stale)$size, na.rm = TRUE) / 1e6), " MB)")
+    unlink(stale)
+  }
+  invisible(try(terra::tmpFiles(current = FALSE, orphan = TRUE, old = TRUE,
+                                remove = TRUE), silent = TRUE))
+}
+
+# The V5 scratch folder inside the project is no longer used. Report it so it
+# can be deleted by hand; nothing is removed automatically inside the project.
+old_tmp <- file.path(cfg$data_dir, "terra_tmp")
+old_tmp2 <- file.path(cfg$root_dir, "terra_tmp")
+for (p in c(old_tmp, old_tmp2)) {
+  if (dir.exists(p)) {
+    fs_ <- list.files(p, full.names = TRUE, recursive = TRUE)
+    message("Obsolete scratch folder still present: ", p, " (", length(fs_),
+            " files, ", round(sum(file.info(fs_)$size, na.rm = TRUE) / 1e6),
+            " MB). It is no longer used and can be deleted manually.")
+  }
+}
+```
+
+```{r preflight}
+# ---------------------------------------------------------------------------
+# Preflight report
+# ---------------------------------------------------------------------------
+
+free_mb <- function(path) {
+  out <- tryCatch(system2("df", c("-Pk", shQuote(path)), stdout = TRUE, stderr = FALSE),
+                  error = function(e) NULL, warning = function(w) NULL)
+  if (is.null(out) || length(out) < 2) return(NA_real_)
+  f <- strsplit(trimws(out[2]), "\\s+")[[1]]
+  if (length(f) < 4) return(NA_real_)
+  suppressWarnings(as.numeric(f[4]) / 1024)
+}
+
+expected_dirs <- c(cfg$root_dir, cfg$data_dir, cfg$raw_dir, cfg$proc_dir,
+                   cfg$out_dir, cfg$tab_dir, cfg$fig_dir, cfg$map_dir,
+                   cfg$tif_dir, cfg$diag_dir, cfg$manual_dir)
+
+preflight <- tibble::tibble(
+  item = c("R version", "terra version", "sf version", "GDAL",
+           "project path", "terra scratch path",
+           "R session tempdir", "free space, scratch (MB)",
+           "free space, project (MB)", "expected directories present"),
+  value = c(
+    paste(R.version$major, R.version$minor, sep = "."),
+    as.character(utils::packageVersion("terra")),
+    as.character(utils::packageVersion("sf")),
+    sf::sf_extSoftVersion()[["GDAL"]],
+    project_norm,
+    local_tmp_norm,
+    tempdir(),
+    ifelse(is.na(free_mb(local_tmp_norm)), "not reported", round(free_mb(local_tmp_norm))),
+    ifelse(is.na(free_mb(project_norm)), "not reported", round(free_mb(project_norm))),
+    paste(sum(dir.exists(expected_dirs)), "of", length(expected_dirs))
+  )
+)
+print(as.data.frame(preflight), right = FALSE)
+
+if (!all(dir.exists(expected_dirs))) {
+  stop("Missing project directories: ",
+       paste(expected_dirs[!dir.exists(expected_dirs)], collapse = ", "))
+}
+
+fs_scratch <- free_mb(local_tmp_norm)
+if (!is.na(fs_scratch) && fs_scratch < 15000) {
+  warning("Less than 15 GB free on the scratch volume. The 30 m stages need ",
+          "room for intermediates; free some space before continuing.")
+}
+```
+
+# Helper functions
+
+Downloading, integrity checking, cached raster products, and the disk-backed
+write helpers used throughout.
+
+```{r helpers}
+`%||%` <- function(a, b) if (!is.null(a) && length(a) && !all(is.na(a))) a else b
+
+msg <- function(...) message(format(Sys.time(), "[%H:%M:%S] "), ...)
+
+# Registry of files produced, used by the final summary.
+.outputs <- character(0)
+register_output <- function(p) {
+  .outputs <<- unique(c(.outputs, p))
+  invisible(p)
+}
+
+# ---------------------------------------------------------------------------
+# Downloads
+# ---------------------------------------------------------------------------
+
+curl_available <- Sys.which("curl") != ""
+
+curl_download <- function(url, dest, resume = TRUE) {
+  if (!curl_available) {
+    utils::download.file(url, destfile = dest, mode = "wb", quiet = TRUE)
+    return(0L)
+  }
+  args <- c(
+    "-L", "--fail", "--silent", "--show-error",
+    "--http1.1",
+    "--retry", "20", "--retry-delay", "10", "--retry-all-errors",
+    "--connect-timeout", "60",
+    "--speed-limit", "1024", "--speed-time", "60"
+  )
+  if (resume) args <- c(args, "-C", "-")
+  args <- c(args, "-o", normalizePath(dest, mustWork = FALSE), url)
+  invisible(system2("curl", args))
+}
+
+get_content_length <- function(url) {
+  tryCatch({
+    r <- httr2::request(url) |>
+      httr2::req_method("HEAD") |>
+      httr2::req_timeout(90) |>
+      httr2::req_perform()
+    cl <- httr2::resp_header(r, "content-length")
+    if (is.null(cl) || is.na(cl) || cl == "") NA_real_ else as.numeric(cl)
+  }, error = function(e) NA_real_)
+}
+
+download_resumable <- function(url, dest, rounds = 40, min_bytes = 1024) {
+  expected <- get_content_length(url)
+  if (is.na(expected)) msg("Server did not report a size for ", basename(dest),
+                           ". Falling back to a validity check only.")
+  for (i in seq_len(rounds)) {
+    have <- if (file.exists(dest)) as.numeric(file.info(dest)$size) else 0
+    if (!is.na(expected) && have >= expected) break
+    msg(sprintf("resume round %d/%d for %s: have %.1f MB%s",
+                i, rounds, basename(dest), have / 1e6,
+                if (is.na(expected)) "" else sprintf(" of %.1f MB", expected / 1e6)))
+    curl_download(url, dest, resume = have > 0)
+    Sys.sleep(2)
+    now <- if (file.exists(dest)) as.numeric(file.info(dest)$size) else 0
+    if (now <= have && i > 3) {
+      msg("No progress on ", basename(dest), ". Restarting the transfer.")
+      unlink(dest)
+    }
+  }
+  if (!file.exists(dest) || as.numeric(file.info(dest)$size) < min_bytes) {
+    stop("Could not download after ", rounds, " resume rounds: ", url)
+  }
+  if (!is.na(expected) && as.numeric(file.info(dest)$size) < expected) {
+    stop("Incomplete after ", rounds, " resume rounds (",
+         round(file.info(dest)$size / 1e6), " of ", round(expected / 1e6), " MB): ", url)
+  }
+  dest
+}
+
+url_exists <- function(url) {
+  tryCatch({
+    r <- httr2::request(url) |>
+      httr2::req_method("HEAD") |>
+      httr2::req_timeout(60) |>
+      httr2::req_error(is_error = function(resp) FALSE) |>
+      httr2::req_perform()
+    httr2::resp_status(r) < 400
+  }, error = function(e) FALSE)
+}
+
+validate_geotiff <- function(path) {
+  if (!file.exists(path) || file.info(path)$size < 2048) return(FALSE)
+  ok <- tryCatch({
+    r <- terra::rast(path)
+    terra::readStart(r)
+    on.exit(terra::readStop(r), add = TRUE)
+    nr <- min(64L, terra::nrow(r)); nc <- min(64L, terra::ncol(r))
+    v <- terra::readValues(r, row = 1, nrows = nr, col = 1, ncols = nc)
+    !is.null(v)
+  }, error = function(e) FALSE)
+  isTRUE(ok)
+}
+
+# Stronger reuse test for cached processed products: open, and check geometry
+# against a reference raster and an expected layer count. This is what stops
+# the workflow silently reusing an incomplete or wrongly aligned product.
+cached_ok <- function(path, ref = NULL, nlyr = NULL, min_bytes = 1024,
+                      label = basename(path)) {
+  if (!file.exists(path)) return(FALSE)
+  sz <- as.numeric(file.info(path)$size)
+  if (is.na(sz) || sz < min_bytes) {
+    msg("cached ", label, " is only ", ifelse(is.na(sz), "unreadable", round(sz)),
+        " bytes, which is implausible. It will be rebuilt.")
+    return(FALSE)
+  }
+  if (!validate_geotiff(path)) {
+    msg("cached ", label, " could not be opened or read. It will be rebuilt.")
+    return(FALSE)
+  }
+  ok <- tryCatch({
+    r <- terra::rast(path)
+    good <- TRUE
+    if (!is.null(nlyr) && terra::nlyr(r) != nlyr) {
+      msg("cached ", label, " has ", terra::nlyr(r), " layers, expected ", nlyr,
+          ". It will be rebuilt.")
+      good <- FALSE
+    }
+    if (good && (is.na(terra::crs(r)) || !nzchar(terra::crs(r)))) {
+      msg("cached ", label, " has no CRS. It will be rebuilt.")
+      good <- FALSE
+    }
+    if (good && !is.null(ref)) {
+      # compareGeom checks extent, resolution, dimensions and CRS together.
+      if (!terra::compareGeom(r, ref, stopOnError = FALSE, messages = FALSE)) {
+        msg("cached ", label, " does not match the reference CRS, extent or ",
+            "resolution. It will be rebuilt.")
+        good <- FALSE
+      }
+    }
+    if (good) {
+      # A truncated GeoTIFF often opens but fails on the last block, so read
+      # the bottom of the file as well as the top.
+      #
+      # readValues() needs an explicit readStart(). Omitting it in V7 made
+      # every cached product report "[readValues] the file is not open for
+      # reading", so every product was declared invalid and rebuilt, and
+      # discard_if_invalid() deleted good files. That is fixed here.
+      nr <- terra::nrow(r)
+      terra::readStart(r)
+      v <- try(terra::readValues(r, row = max(1L, nr - 1L), nrows = min(2L, nr),
+                                 col = 1, ncols = min(64L, terra::ncol(r))),
+               silent = TRUE)
+      try(terra::readStop(r), silent = TRUE)
+      if (inherits(v, "try-error") || is.null(v) || !length(v)) good <- FALSE
+    }
+    good
+  }, error = function(e) {
+    msg("cached ", label, " failed validation (", conditionMessage(e),
+        "). It will be rebuilt.")
+    FALSE
+  })
+  if (isTRUE(ok)) msg("reusing cached product: ", label)
+  isTRUE(ok)
+}
+
+# Delete a cached or scratch raster that does not pass validation. Only the
+# named file is removed; reusable products that are valid are never touched.
+# Delete a cached raster only when it is genuinely unusable: absent from disk,
+# implausibly small, or impossible to open and read. A layer count or geometry
+# mismatch is reported and the file is left in place, because the rebuild
+# overwrites it anyway and deleting a good file on a false negative is the
+# worse failure. V7 deleted on any negative result, which combined with the
+# readValues bug above destroyed correct products.
+discard_if_invalid <- function(path, min_bytes = 1024, label = basename(path)) {
+  if (!file.exists(path)) return(invisible(FALSE))
+  sz <- as.numeric(file.info(path)$size)
+  unusable <- is.na(sz) || sz < min_bytes || !validate_geotiff(path)
+  if (!unusable) return(invisible(TRUE))
+  msg("removing damaged or unreadable file: ", path)
+  unlink(path); unlink(paste0(path, ".aux.xml"))
+  invisible(FALSE)
+}
+
+download_geotiff_safe <- function(url, dest, tries = 3) {
+  if (file.exists(dest) && validate_geotiff(dest)) {
+    exp <- get_content_length(url)
+    if (is.na(exp) || identical(as.numeric(file.info(dest)$size), exp)) {
+      msg("cached and valid: ", basename(dest))
+      return(dest)
+    }
+  }
+  expected <- get_content_length(url)
+  for (i in seq_len(tries)) {
+    msg(sprintf("download attempt %d/%d: %s", i, tries, basename(dest)))
+    if (!file.exists(dest)) curl_download(url, dest, resume = FALSE)
+    else                    curl_download(url, dest, resume = TRUE)
+    if (!is.na(expected)) {
+      actual <- file.info(dest)$size
+      if (!identical(as.numeric(actual), expected)) {
+        msg(sprintf("size mismatch for %s (%.0f vs %.0f). Refetching from scratch.",
+                    basename(dest), actual, expected))
+        unlink(dest); curl_download(url, dest, resume = FALSE)
+      }
+    }
+    if (validate_geotiff(dest)) return(dest)
+    msg("GeoTIFF failed to open. Deleting and retrying.")
+    unlink(dest); Sys.sleep(3)
+  }
+  stop("Could not obtain a valid GeoTIFF after ", tries, " attempts: ", url)
+}
+
+download_file_safe <- function(url, dest, tries = 3, min_bytes = 1024) {
+  if (file.exists(dest) && file.info(dest)$size >= min_bytes) {
+    msg("cached: ", basename(dest)); return(dest)
+  }
+  for (i in seq_len(tries)) {
+    msg(sprintf("download attempt %d/%d: %s", i, tries, basename(dest)))
+    try(curl_download(url, dest, resume = file.exists(dest)), silent = TRUE)
+    if (file.exists(dest) && file.info(dest)$size >= min_bytes) return(dest)
+    unlink(dest); Sys.sleep(3)
+  }
+  stop("Could not download: ", url)
+}
+
+is_zip_file <- function(path) {
+  if (!file.exists(path) || file.info(path)$size < 4) return(FALSE)
+  con <- file(path, "rb"); on.exit(close(con), add = TRUE)
+  identical(readBin(con, what = "raw", n = 2), charToRaw("PK"))
+}
+
+gdrive_download <- function(file_id, dest, overwrite = FALSE) {
+  if (file.exists(dest) && !overwrite && is_zip_file(dest)) return(dest)
+  base <- sprintf("https://drive.google.com/uc?export=download&id=%s", file_id)
+  r1 <- httr2::request(base) |>
+    httr2::req_options(followlocation = TRUE) |>
+    httr2::req_timeout(600) |>
+    httr2::req_perform()
+  ct <- tolower(httr2::resp_header(r1, "content-type") %||% "")
+  body_raw <- httr2::resp_body_raw(r1)
+  if (!grepl("text/html", ct)) { writeBin(body_raw, dest); return(dest) }
+  html  <- rawToChar(body_raw)
+  token <- stringr::str_match(html, "confirm=([0-9A-Za-z_\\-]+)")[, 2]
+  if (is.na(token) || token == "") { writeBin(body_raw, dest); return(dest) }
+  r2 <- httr2::request(paste0(base, "&confirm=", token)) |>
+    httr2::req_options(followlocation = TRUE) |>
+    httr2::req_timeout(1800) |>
+    httr2::req_perform()
+  writeBin(httr2::resp_body_raw(r2), dest)
+  dest
+}
+
+# ---------------------------------------------------------------------------
+# Raster utilities
+# ---------------------------------------------------------------------------
+
+tiles_for_bbox <- function(bbox) {
+  eps <- 1e-9
+  lon_w <- seq(floor((as.numeric(bbox["xmin"]) + eps) / 10) * 10,
+               floor((as.numeric(bbox["xmax"]) - eps) / 10) * 10, by = 10)
+  lat_l <- seq(floor((as.numeric(bbox["ymin"]) + eps) / 10) * 10,
+               floor((as.numeric(bbox["ymax"]) - eps) / 10) * 10, by = 10)
+  lat_u <- lat_l + 10
+  lat_tag <- function(x) if (x >= 0) sprintf("%02dN", abs(x)) else sprintf("%02dS", abs(x))
+  lon_tag <- function(x) if (x >= 0) sprintf("%03dE", abs(x)) else sprintf("%03dW", abs(x))
+  out <- character(0)
+  for (lu in lat_u) for (lw in lon_w) out <- c(out, paste0(lat_tag(lu), "_", lon_tag(lw)))
+  unique(out)
+}
+
+# Standard write options. LZW keeps intermediates small, tiling keeps the
+# streaming reads in the block engine cheap.
+wopt_int  <- list(datatype = "INT1U", gdal = c("COMPRESS=LZW", "TILED=YES"))
+wopt_flt  <- list(datatype = "FLT4S", gdal = c("COMPRESS=LZW", "TILED=YES"))
+
+# A scratch path inside the safe terra directory, for our own intermediates.
+scratch_dir <- file.path(local_tmp_norm, "scratch")
+dir.create(scratch_dir, showWarnings = FALSE, recursive = TRUE)
+scratch <- function(name) file.path(scratch_dir, name)
+
+# Remove specific scratch files we created, once nothing references them.
+drop_scratch <- function(paths) {
+  paths <- paths[file.exists(paths)]
+  if (length(paths)) {
+    unlink(paths)
+    unlink(paste0(paths, ".aux.xml"))
+  }
+  invisible(NULL)
+}
+
+# Release terra temporaries between stages. Only files left by earlier R
+# sessions are removed: current and orphan files are left alone, because a
+# live SpatRaster may still be backed by one of them. gc() lets terra release
+# its own unreferenced temporaries safely.
+sweep_temp <- function() {
+  gc()
+  # terra::tmpFiles() can only find "old" files when terra uses the R session
+  # tempdir, which it does not here, so calling it just emits a warning on
+  # every stage. gc() is what actually releases terra temporaries.
+  invisible(NULL)
+}
+
+# Build a GDAL VRT over a set of tiles. A VRT references the tiles rather than
+# copying pixels, so four 600 MB Hansen tiles never coexist in memory.
+build_vrt <- function(tile_paths, vrt_path) {
+  if (!length(tile_paths)) stop("no tiles supplied for ", basename(vrt_path))
+  unlink(vrt_path)
+  v <- terra::vrt(tile_paths, filename = vrt_path, overwrite = TRUE)
+  v
+}
+
+# Replace NA with 0, written straight to disk with a one byte datatype.
+na0_to_file <- function(r, filename, wopt = wopt_int) {
+  terra::ifel(is.na(r), 0, r, filename = filename, overwrite = TRUE, wopt = wopt)
+}
+
+# In-memory NA to zero, for small rasters only.
+na0 <- function(r) terra::ifel(is.na(r), 0, r)
+
+write_table <- function(x, path) {
+  readr::write_csv(as.data.frame(x), path, na = "")
+  msg("wrote ", path)
+  register_output(path)
+  invisible(path)
+}
+
+# Every figure and map is written as 400 dpi PNG and as PDF, both directly in
+# the target directory. No png/ or pdf/ subdirectories are created.
+save_plot_both <- function(plot, name, dir, width = 8, height = 5, dpi = 400) {
+  png_p <- file.path(dir, paste0(name, ".png"))
+  pdf_p <- file.path(dir, paste0(name, ".pdf"))
+  ggplot2::ggsave(png_p, plot, width = width, height = height, dpi = dpi,
+                  bg = "white")
+  ok <- try(ggplot2::ggsave(pdf_p, plot, width = width, height = height,
+                            device = grDevices::cairo_pdf, bg = "white"),
+            silent = TRUE)
+  if (inherits(ok, "try-error")) {
+    try(ggplot2::ggsave(pdf_p, plot, width = width, height = height,
+                        device = "pdf", bg = "white"), silent = TRUE)
+  }
+  msg("wrote ", png_p, " and ", basename(pdf_p))
+  register_output(png_p); register_output(pdf_p)
+  invisible(c(png_p, pdf_p))
+}
+
+save_fig <- function(plot, name, width = 8, height = 5, dpi = 400) {
+  save_plot_both(plot, name, cfg$fig_dir, width, height, dpi)
+}
+save_map <- function(plot, name, width = 7.5, height = 7, dpi = 400) {
+  save_plot_both(plot, name, cfg$map_dir, width, height, dpi)
+}
+
+write_tif <- function(r, path, wopt = wopt_flt) {
+  terra::writeRaster(r, path, overwrite = TRUE,
+                     datatype = wopt$datatype, gdal = wopt$gdal)
+  msg("wrote ", path)
+  register_output(path)
+  invisible(path)
+}
+
+theme_paper <- ggplot2::theme_minimal(base_size = 11) +
+  ggplot2::theme(
+    panel.grid.minor = ggplot2::element_blank(),
+    panel.grid.major = ggplot2::element_line(linewidth = 0.25, colour = "grey88"),
+    axis.title  = ggplot2::element_text(face = "plain", size = 11),
+    axis.text   = ggplot2::element_text(size = 9),
+    legend.text = ggplot2::element_text(size = 9),
+    plot.title  = ggplot2::element_text(face = "bold", size = 12),
+    plot.margin = ggplot2::margin(6, 10, 6, 6),
+    legend.position = "bottom"
+  )
+```
+
+# Optional manual inputs
+
+Only one layer cannot be pulled from a stable open URL: the boundaries of
+industrial logging and mining concessions. The analysis runs without it and
+drops the concession covariate.
+
+```{r manual-inputs}
+manual_spec <- tibble::tibble(
+  purpose = c("logging and mining concessions"),
+  expected_file = c("concessions.gpkg"),
+  where = c(paste(
+    "Global Forest Watch open data portal (data.globalforestwatch.org),",
+    "layers 'Managed forest concessions' and 'Mining concessions',",
+    "filtered to COG and COD, saved as a single GeoPackage."
+  ))
+)
+
+manual_path <- file.path(cfg$manual_dir, "concessions.gpkg")
+have_concessions <- file.exists(manual_path)
+
+if (!have_concessions) {
+  msg("Optional layer not found: ", manual_path)
+  msg("The analysis will proceed without the concession covariate.")
+  print(as.data.frame(manual_spec))
+} else {
+  msg("Found optional concession layer: ", manual_path)
+}
+```
+
+# Administrative boundaries
+
+```{r admin-boundaries}
+iso_list <- if (isTRUE(cfg$include_drc)) c("COG", "COD") else "COG"
+
+get_adm1_geoboundaries <- function(iso) {
+  api <- sprintf("https://www.geoboundaries.org/api/current/gbOpen/%s/ADM1/", iso)
+  meta <- jsonlite::fromJSON(api)
+  url  <- meta$gjDownloadURL
+  if (is.null(url) || !nzchar(url)) stop("no gjDownloadURL for ", iso)
+  dest <- file.path(cfg$raw_dir, sprintf("geoBoundaries_%s_ADM1.geojson", iso))
+  download_file_safe(url, dest, min_bytes = 5000)
+  x <- sf::st_read(dest, quiet = TRUE)
+  names(x)[names(x) == "shapeName"] <- "adm1_name"
+  x$iso3 <- iso
+  x[, c("adm1_name", "iso3")]
+}
+
+get_adm1_gadm <- function(iso) {
+  url  <- sprintf("https://geodata.ucdavis.edu/gadm/gadm4.1/gpkg/gadm41_%s.gpkg", iso)
+  dest <- file.path(cfg$raw_dir, sprintf("gadm41_%s.gpkg", iso))
+  download_file_safe(url, dest, min_bytes = 100000)
+  lyrs <- sf::st_layers(dest)$name
+  lyr  <- lyrs[grepl("_1$", lyrs)][1]
+  x <- sf::st_read(dest, layer = lyr, quiet = TRUE)
+  names(x)[names(x) == "NAME_1"] <- "adm1_name"
+  x$iso3 <- iso
+  x[, c("adm1_name", "iso3")]
+}
+
+adm1_list <- lapply(iso_list, function(iso) {
+  out <- try(get_adm1_geoboundaries(iso), silent = TRUE)
+  if (inherits(out, "try-error")) {
+    msg("geoBoundaries failed for ", iso, ". Trying GADM.")
+    out <- try(get_adm1_gadm(iso), silent = TRUE)
+  }
+  if (inherits(out, "try-error")) {
+    stop("Could not obtain ADM1 boundaries for ", iso,
+         ". Download gadm41_", iso, ".gpkg from https://gadm.org/download_country.html",
+         " and place it in ", cfg$raw_dir)
+  }
+  out
+})
+
+adm1 <- do.call(rbind, lapply(adm1_list, function(x) sf::st_transform(x, 4326)))
+adm1 <- sf::st_make_valid(adm1)
+rm(adm1_list)
+
+countries <- adm1 |>
+  dplyr::group_by(iso3) |>
+  dplyr::summarise(.groups = "drop") |>
+  sf::st_make_valid()
+
+sf::write_sf(adm1,      file.path(cfg$proc_dir, "adm1.gpkg"),      delete_dsn = TRUE)
+sf::write_sf(countries, file.path(cfg$proc_dir, "countries.gpkg"), delete_dsn = TRUE)
+
+msg("ADM1 units loaded: ", nrow(adm1), " across ", paste(iso_list, collapse = ", "))
+print(sf::st_bbox(countries))
+```
+
+# CongoPeat peatland map and study domain
+
+```{r congopeat}
+peat_zip <- file.path(cfg$raw_dir, "CongoPeat_SimplifiedPeat_100m.zip")
+peat_dir <- file.path(cfg$raw_dir, "congopeat_100m")
+dir.create(peat_dir, showWarnings = FALSE, recursive = TRUE)
+
+peat_tifs <- list.files(peat_dir, pattern = "\\.tif$|\\.tiff$",
+                        full.names = TRUE, recursive = TRUE)
+
+if (!length(peat_tifs)) {
+  gdrive_download("1MG6YYZ8ULOXxYRIL-P7LMQIFpk6Kr_mm", peat_zip)
+  if (!is_zip_file(peat_zip)) gdrive_download("1MG6YYZ8ULOXxYRIL-P7LMQIFpk6Kr_mm",
+                                              peat_zip, overwrite = TRUE)
+  if (!is_zip_file(peat_zip)) {
+    stop("CongoPeat download did not return a ZIP archive. Download the ",
+         "simplified 100 m peat map manually from https://congopeat.net/maps ",
+         "and unzip it into ", peat_dir)
+  }
+  utils::unzip(peat_zip, exdir = peat_dir, overwrite = TRUE)
+  peat_tifs <- list.files(peat_dir, pattern = "\\.tif$|\\.tiff$",
+                          full.names = TRUE, recursive = TRUE)
+}
+if (!length(peat_tifs)) stop("No GeoTIFF found under ", peat_dir)
+
+# Preflight: the file must be physically present, not a cloud placeholder.
+if (file.info(peat_tifs[1])$size < 1e5) {
+  stop("The CongoPeat raster at ", peat_tifs[1], " is implausibly small (",
+       file.info(peat_tifs[1])$size, " bytes). If it shows a cloud icon in ",
+       "Finder, download it locally before rerunning.")
+}
+
+peat_raw <- terra::rast(peat_tifs[1])
+if (is.na(terra::crs(peat_raw)) || terra::crs(peat_raw) == "") {
+  terra::crs(peat_raw) <- "EPSG:4326"
+}
+if (!terra::same.crs(peat_raw, "EPSG:4326")) {
+  pr_path <- file.path(cfg$proc_dir, "congopeat_4326.tif")
+  if (!validate_geotiff(pr_path)) {
+    terra::project(peat_raw, "EPSG:4326", method = "near",
+                   filename = pr_path, overwrite = TRUE, wopt = wopt_int)
+  }
+  peat_raw <- terra::rast(pr_path)
+}
+
+msg("CongoPeat raster:")
+print(peat_raw)
+```
+
+```{r study-domain}
+# "peat_buffer" (default): the mapped peat swamp forest footprint plus a
+#   buffer, intersected with the selected countries.
+# "bbox": the full CongoPeat footprint.
+
+build_domain_peat_buffer <- function() {
+  msg("Deriving the domain from the peat footprint plus a ",
+      cfg$domain_buffer_km, " km buffer.")
+  pb <- terra::aggregate(peat_raw == cfg$peat_class, fact = 11,
+                         fun = "max", na.rm = TRUE)   # about 1 km
+  pb <- terra::ifel(pb < 1, NA, 1)
+  poly <- terra::as.polygons(pb, dissolve = TRUE)
+  psf  <- sf::st_make_valid(sf::st_as_sf(poly))
+  psf  <- sf::st_union(psf)
+  buf  <- sf::st_buffer(psf, units::set_units(cfg$domain_buffer_km, "km"))
+  out  <- sf::st_make_valid(buf)
+  rm(pb, poly, psf); gc()
+  out
+}
+
+domain_frame <- NULL
+if (identical(cfg$domain_mode, "peat_buffer")) {
+  domain_frame <- try(build_domain_peat_buffer(), silent = TRUE)
+  if (inherits(domain_frame, "try-error")) {
+    msg("Peat buffer domain failed. Falling back to the CongoPeat bounding box.")
+    domain_frame <- NULL
+  }
+}
+if (is.null(domain_frame)) {
+  domain_frame <- sf::st_as_sfc(sf::st_bbox(
+    c(xmin = terra::xmin(peat_raw), ymin = terra::ymin(peat_raw),
+      xmax = terra::xmax(peat_raw), ymax = terra::ymax(peat_raw)),
+    crs = 4326))
+}
+
+domain <- sf::st_intersection(sf::st_make_valid(countries), domain_frame) |>
+  sf::st_make_valid()
+domain_union <- sf::st_union(domain) |> sf::st_make_valid()
+rm(domain, domain_frame)
+
+snap_out <- function(bb, step) {
+  # bb["xmin"] keeps the name "xmin"; wrapping it in c(xmin = ...) would make
+  # a compound name such as "xmin.xmin" and the coordinates would come back
+  # NA later. Strip names before rebuilding.
+  bbv <- unname(as.numeric(bb[c("xmin", "ymin", "xmax", "ymax")]))
+  names(bbv) <- c("xmin", "ymin", "xmax", "ymax")
+  out <- c(
+    xmin = floor(bbv[["xmin"]] / step) * step,
+    ymin = floor(bbv[["ymin"]] / step) * step,
+    xmax = ceiling(bbv[["xmax"]] / step) * step,
+    ymax = ceiling(bbv[["ymax"]] / step) * step
+  )
+  if (any(!is.finite(out)) ||
+      out[["xmin"]] >= out[["xmax"]] ||
+      out[["ymin"]] >= out[["ymax"]]) {
+    stop("Invalid snapped study extent: ",
+         paste(names(out), signif(out, 8), sep = "=", collapse = ", "))
+  }
+  out
+}
+
+dom_bb <- snap_out(sf::st_bbox(domain_union), cfg$grid_deg)
+dom_ext <- terra::ext(
+  unname(dom_bb[["xmin"]]), unname(dom_bb[["xmax"]]),
+  unname(dom_bb[["ymin"]]), unname(dom_bb[["ymax"]])
+)
+
+sf::write_sf(sf::st_sf(geometry = domain_union),
+             file.path(cfg$proc_dir, "study_domain.gpkg"), delete_dsn = TRUE)
+domain_v <- terra::vect(sf::st_sf(geometry = domain_union))
+
+msg("Study domain extent (deg): ", paste(round(as.vector(dom_bb), 3), collapse = ", "))
+sweep_temp()
+```
+
+# Hansen Global Forest Change
+
+Tiles are assembled through a GDAL VRT. A VRT references the tiles instead of
+copying pixels, so four 600 MB tiles never coexist in memory. Crop and mask
+are then streamed to a compressed one-byte GeoTIFF.
+
+```{r hansen-version}
+gfc_candidates <- c("GFC-2025-v1.13", "GFC-2024-v1.12", "GFC-2023-v1.11")
+gfc_base <- "https://storage.googleapis.com/earthenginepartners-hansen"
+
+probe_tile <- tiles_for_bbox(dom_bb)[1]
+gfc_version <- NA_character_
+for (v in gfc_candidates) {
+  u <- sprintf("%s/%s/Hansen_%s_lossyear_%s.tif", gfc_base, v, v, probe_tile)
+  if (url_exists(u)) { gfc_version <- v; break }
+}
+if (is.na(gfc_version)) stop("No reachable Hansen GFC release among: ",
+                             paste(gfc_candidates, collapse = ", "))
+
+gfc_last_year <- as.integer(sub("^GFC-(\\d{4}).*$", "\\1", gfc_version))
+cfg$year_max <- min(cfg$year_max, gfc_last_year)
+cfg$recent_window[2] <- min(cfg$recent_window[2], cfg$year_max)
+
+msg("Using ", gfc_version, ", loss years 2001 to ", cfg$year_max)
+```
+
+```{r hansen-download}
+gfc_tiles <- tiles_for_bbox(dom_bb)
+msg("Hansen tiles required: ", paste(gfc_tiles, collapse = ", "))
+
+# Fetch the tiles and return their paths. Nothing is opened into memory here.
+gfc_tile_paths <- function(band) {
+  paths <- character(0)
+  for (i in seq_along(gfc_tiles)) {
+    t <- gfc_tiles[i]
+    msg(sprintf("Hansen %s tile %d of %d: %s", band, i, length(gfc_tiles), t))
+    url  <- sprintf("%s/%s/Hansen_%s_%s_%s.tif", gfc_base, gfc_version,
+                    gfc_version, band, t)
+    dest <- file.path(cfg$raw_dir, sprintf("Hansen_%s_%s_%s.tif",
+                                           gfc_version, band, t))
+    download_geotiff_safe(url, dest)
+    r <- terra::rast(dest)
+    e <- terra::intersect(terra::ext(r), dom_ext)
+    if (is.null(e) || terra::xmax(e) <= terra::xmin(e) ||
+        terra::ymax(e) <= terra::ymin(e)) {
+      msg("  tile does not intersect the domain, skipping")
+      next
+    }
+    paths <- c(paths, dest)
+    rm(r)
+  }
+  if (!length(paths)) stop("No Hansen ", band, " tile intersects the domain.")
+  paths
+}
+
+# Crop a VRT to the domain and mask it, streaming both steps to disk.
+crop_mask_to_domain <- function(src, out_path, label, wopt = wopt_int) {
+  tmp_crop <- scratch(paste0(label, "_crop.tif"))
+  msg("cropping ", label, " to the study domain")
+  terra::crop(src, dom_ext, filename = tmp_crop, overwrite = TRUE, wopt = wopt)
+  msg("masking ", label, " to the study domain")
+  terra::mask(terra::rast(tmp_crop), domain_v,
+              filename = out_path, overwrite = TRUE, wopt = wopt)
+  drop_scratch(tmp_crop)
+  sweep_temp()
+  out_path
+}
+
+loss_path <- file.path(cfg$proc_dir, "lossyear_domain.tif")
+if (!validate_geotiff(loss_path)) {
+  lp <- gfc_tile_paths("lossyear")
+  vrt_loss <- build_vrt(lp, scratch("hansen_lossyear.vrt"))
+  ok <- try(crop_mask_to_domain(vrt_loss, loss_path, "lossyear"), silent = TRUE)
+  rm(vrt_loss); drop_scratch(scratch("hansen_lossyear.vrt")); sweep_temp()
+  if (inherits(ok, "try-error")) {
+    stop("Failed while building lossyear_domain.tif. Message: ",
+         attr(ok, "condition")$message)
+  }
+}
+lossyear <- terra::rast(loss_path)
+names(lossyear) <- "lossyear"
+print(lossyear)
+```
+
+```{r hansen-treecover}
+tc_path <- file.path(cfg$proc_dir, "treecover2000_domain.tif")
+have_treecover <- FALSE
+
+if (isTRUE(cfg$download_treecover2000)) {
+  if (!cached_ok(tc_path, ref = lossyear, nlyr = 1, label = "treecover2000_domain.tif")) {
+    ok <- try({
+      tp <- gfc_tile_paths("treecover2000")
+      vrt_tc <- build_vrt(tp, scratch("hansen_treecover.vrt"))
+      crop_mask_to_domain(vrt_tc, tc_path, "treecover2000")
+      rm(vrt_tc); drop_scratch(scratch("hansen_treecover.vrt")); sweep_temp()
+      TRUE
+    }, silent = TRUE)
+    if (inherits(ok, "try-error")) {
+      warning("treecover2000 could not be obtained (",
+              attr(ok, "condition")$message,
+              "). Falling back to a CongoPeat based forest baseline and ",
+              "skipping the canopy-threshold sensitivity.")
+    }
+  }
+  have_treecover <- validate_geotiff(tc_path)
+}
+
+treecover <- if (have_treecover) {
+  r <- terra::rast(tc_path); names(r) <- "treecover2000"; r
+} else NULL
+
+msg("treecover2000 available: ", have_treecover)
+sweep_temp()
+```
+
+# Fire attribution layer
+
+```{r fire-download}
+fire_url  <- paste0("https://glad.umd.edu/users/Alexandra/Fire_GFL_data/2001-25/",
+                    "AFR_fire_forest_loss_2001-25_annual.tif")
+fire_raw  <- file.path(cfg$raw_dir, "AFR_fire_forest_loss_2001-25_annual.tif")
+fire_path <- file.path(cfg$proc_dir, "fireyear_domain.tif")
+
+Sys.setenv(
+  GDAL_HTTP_VERSION = "1.1",
+  GDAL_HTTP_MAX_RETRY = "10",
+  GDAL_HTTP_RETRY_DELAY = "5",
+  GDAL_DISABLE_READDIR_ON_OPEN = "EMPTY_DIR",
+  CPL_VSIL_CURL_ALLOWED_EXTENSIONS = ".tif"
+)
+
+if (!cached_ok(fire_path, ref = lossyear, nlyr = 1, label = "fireyear_domain.tif")) {
+
+  fr <- NULL
+
+  if (validate_geotiff(fire_raw)) {
+    msg("Fire mosaic already present locally.")
+    fr <- terra::rast(fire_raw)
+  } else {
+    ok <- try(download_resumable(fire_url, fire_raw, rounds = 40,
+                                 min_bytes = 1e7), silent = TRUE)
+    if (!inherits(ok, "try-error") && validate_geotiff(fire_raw)) {
+      fr <- terra::rast(fire_raw)
+    } else {
+      msg("Full download of the fire mosaic did not complete.")
+      unlink(fire_raw)
+    }
+  }
+
+  if (is.null(fr)) {
+    msg("Trying a windowed read over the network instead.")
+    fr <- try(terra::rast(paste0("/vsicurl/", fire_url)), silent = TRUE)
+    if (inherits(fr, "try-error")) fr <- NULL
+  }
+
+  if (is.null(fr)) {
+    stop("Could not obtain the fire attribution layer.\n",
+         "Download it in a terminal with a resumable client:\n",
+         "  wget -c '", fire_url, "'\n",
+         "then move the file to:\n  ", normalizePath(cfg$raw_dir, mustWork = FALSE),
+         "\nand rerun this chunk.")
+  }
+
+  if (is.na(terra::crs(fr)) || terra::crs(fr) == "") terra::crs(fr) <- "EPSG:4326"
+
+  tmp_fire <- scratch("fire_crop.tif")
+  msg("cropping the fire mosaic to the study domain")
+  terra::crop(fr, dom_ext, filename = tmp_fire, overwrite = TRUE, wopt = wopt_int)
+  rm(fr); sweep_temp()
+
+  frc <- terra::rast(tmp_fire)
+  if (!terra::compareGeom(frc, lossyear, stopOnError = FALSE, messages = FALSE)) {
+    msg("Fire grid differs from the Hansen grid. Resampling with nearest neighbour.")
+    tmp_fire2 <- scratch("fire_resamp.tif")
+    terra::resample(frc, lossyear, method = "near",
+                    filename = tmp_fire2, overwrite = TRUE, wopt = wopt_int)
+    rm(frc); drop_scratch(tmp_fire); sweep_temp()
+    frc <- terra::rast(tmp_fire2)
+    tmp_fire <- tmp_fire2
+  }
+  msg("masking the fire layer to the study domain")
+  terra::mask(frc, domain_v, filename = fire_path, overwrite = TRUE, wopt = wopt_int)
+  rm(frc); drop_scratch(tmp_fire); sweep_temp()
+}
+
+fireyear <- terra::rast(fire_path)
+names(fireyear) <- "fireyear"
+
+if (!terra::compareGeom(fireyear, lossyear, stopOnError = FALSE, messages = FALSE)) {
+  stop("fireyear_domain.tif and lossyear_domain.tif are not on the same grid. ",
+       "Delete both from ", cfg$proc_dir, " and rerun.")
+}
+print(fireyear)
+```
+
+# Peat mask on the Hansen grid
+
+```{r peat-on-hansen}
+peat30_path <- file.path(cfg$proc_dir, "peatclass_domain_30m.tif")
+if (!cached_ok(peat30_path, ref = lossyear, nlyr = 1,
+               label = "peatclass_domain_30m.tif")) {
+  tmp_p1 <- scratch("peat_crop30.tif")
+  msg("cropping CongoPeat to the Hansen extent")
+  terra::crop(peat_raw, terra::ext(lossyear),
+              filename = tmp_p1, overwrite = TRUE, wopt = wopt_int)
+  msg("resampling CongoPeat to the 30 m grid (nearest neighbour)")
+  tmp_p2 <- scratch("peat_res30.tif")
+  terra::resample(terra::rast(tmp_p1), lossyear, method = "near",
+                  filename = tmp_p2, overwrite = TRUE, wopt = wopt_int)
+  drop_scratch(tmp_p1); sweep_temp()
+  msg("masking the 30 m peat classification to the study domain")
+  terra::mask(terra::rast(tmp_p2), domain_v,
+              filename = peat30_path, overwrite = TRUE, wopt = wopt_int)
+  drop_scratch(tmp_p2); sweep_temp()
+}
+peat30 <- terra::rast(peat30_path)
+names(peat30) <- "peatclass"
+
+peat100_path <- file.path(cfg$proc_dir, "peatclass_domain_100m.tif")
+if (!validate_geotiff(peat100_path)) {
+  tmp_p3 <- scratch("peat_crop100.tif")
+  terra::crop(peat_raw, dom_ext, filename = tmp_p3, overwrite = TRUE, wopt = wopt_int)
+  terra::mask(terra::rast(tmp_p3), domain_v,
+              filename = peat100_path, overwrite = TRUE, wopt = wopt_int)
+  drop_scratch(tmp_p3); sweep_temp()
+}
+peat100 <- terra::rast(peat100_path)
+
+# peat_raw is no longer needed; peat30 and peat100 replace it.
+rm(peat_raw); sweep_temp()
+
+peat_freq_path <- file.path(cfg$diag_dir, "peat_class_frequency.csv")
+if (file.exists(peat_freq_path)) {
+  peat_freq <- readr::read_csv(peat_freq_path, show_col_types = FALSE)
+  msg("reusing cached peat class frequency table")
+} else {
+  peat_freq <- as.data.frame(terra::freq(peat100))
+  write_table(peat_freq, peat_freq_path)
+}
+register_output(peat_freq_path)
+print(peat_freq)
+```
+
+# Protected areas from the WDPA
+
+```{r wdpa}
+wdpa_url <- paste0("https://data-gis.unep-wcmc.org/server/rest/services/ProtectedSites/",
+                   "The_World_Database_of_Protected_Areas/FeatureServer/1/query")
+
+wdpa_page <- function(offset, page = 500L) {
+  req <- httr2::request(wdpa_url) |>
+    httr2::req_url_query(
+      where             = "1=1",
+      geometry          = sprintf("%f,%f,%f,%f", dom_bb["xmin"], dom_bb["ymin"],
+                                  dom_bb["xmax"], dom_bb["ymax"]),
+      geometryType      = "esriGeometryEnvelope",
+      inSR              = "4326",
+      spatialRel        = "esriSpatialRelIntersects",
+      outFields         = "*",
+      returnGeometry    = "true",
+      outSR             = "4326",
+      resultOffset      = offset,
+      resultRecordCount = page,
+      f                 = "geojson"
+    ) |>
+    httr2::req_timeout(600)
+  txt <- httr2::resp_body_string(httr2::req_perform(req))
+  f <- file.path(tempdir(), sprintf("wdpa_%d.geojson", offset))
+  writeLines(txt, f)
+  out <- try(sf::st_read(f, quiet = TRUE), silent = TRUE)
+  unlink(f)
+  if (inherits(out, "try-error")) return(NULL)
+  out
+}
+
+wdpa_path <- file.path(cfg$proc_dir, "wdpa_domain.gpkg")
+if (!file.exists(wdpa_path)) {
+  acc <- list(); off <- 0L; page <- 500L
+  repeat {
+    p <- wdpa_page(off, page)
+    if (is.null(p) || nrow(p) == 0) break
+    acc[[length(acc) + 1L]] <- p[, intersect(names(p), c("WDPAID", "NAME", "DESIG_ENG",
+                                                         "IUCN_CAT", "STATUS", "STATUS_YR",
+                                                         "ISO3", "MARINE")), drop = FALSE]
+    msg("WDPA page at offset ", off, ": ", nrow(p), " features")
+    if (nrow(p) < page) break
+    off <- off + page
+    if (off > 20000L) break
+  }
+  if (!length(acc)) stop("WDPA query returned nothing. Check network access to ",
+                         "data-gis.unep-wcmc.org, or download the COG and COD ",
+                         "country packages from protectedplanet.net and merge them ",
+                         "into ", wdpa_path)
+  pa <- do.call(rbind, acc) |> sf::st_make_valid() |> sf::st_transform(4326)
+  pa <- pa[!sf::st_is_empty(pa), , drop = FALSE]
+  pa <- sf::st_filter(pa, sf::st_sf(geometry = domain_union))
+  sf::write_sf(pa, wdpa_path, delete_dsn = TRUE)
+  rm(acc); gc()
+}
+pa <- sf::st_read(wdpa_path, quiet = TRUE)
+msg("Protected areas intersecting the domain: ", nrow(pa))
+```
+
+# Roads, rivers and settlements from OpenStreetMap
+
+The Geofabrik archives are large. The spatial filter is pushed into GDAL at
+read time so a national road layer is never fully loaded, only the columns
+needed are kept, and the clipped subsets are cached in `data/processed/` for
+later runs.
+
+```{r osm}
+geofabrik <- c(COG = "congo-brazzaville", COD = "congo-democratic-republic")
+
+osm_cache <- file.path(cfg$proc_dir,
+                       c(roads_all = "roads_all.gpkg", roads_major = "roads_major.gpkg",
+                         places_pop = "places_pop.gpkg", rivers = "rivers.gpkg"))
+names(osm_cache) <- c("roads_all", "roads_major", "places_pop", "rivers")
+
+osm_buffer_deg <- 0.5
+bbv <- unname(as.numeric(dom_bb[c("xmin", "ymin", "xmax", "ymax")])) +
+  c(-osm_buffer_deg, -osm_buffer_deg, osm_buffer_deg, osm_buffer_deg)
+dom_box <- sf::st_as_sfc(sf::st_bbox(
+  c(xmin = bbv[1], ymin = bbv[2], xmax = bbv[3], ymax = bbv[4]), crs = 4326))
+dom_box_wkt <- sf::st_as_text(dom_box)
+
+major_classes <- c("motorway", "trunk", "primary", "secondary", "tertiary",
+                   "motorway_link", "trunk_link", "primary_link",
+                   "secondary_link", "tertiary_link")
+
+if (all(file.exists(osm_cache[c("roads_all", "places_pop", "rivers")]))) {
+
+  msg("reusing cached OpenStreetMap subsets from ", cfg$proc_dir)
+  roads_all   <- sf::st_read(osm_cache[["roads_all"]],   quiet = TRUE)
+  roads_major <- if (file.exists(osm_cache[["roads_major"]]))
+    sf::st_read(osm_cache[["roads_major"]], quiet = TRUE) else NULL
+  places_pop  <- sf::st_read(osm_cache[["places_pop"]],  quiet = TRUE)
+  rivers      <- sf::st_read(osm_cache[["rivers"]],      quiet = TRUE)
+
+} else {
+
+  osm_layers <- list()
+  for (iso in iso_list) {
+    slug <- geofabrik[[iso]]
+    zipf <- file.path(cfg$raw_dir, sprintf("%s-latest-free.shp.zip", slug))
+    outd <- file.path(cfg$raw_dir, sprintf("osm_%s", iso))
+    dir.create(outd, showWarnings = FALSE, recursive = TRUE)
+    if (!length(list.files(outd, pattern = "gis_osm_roads_free_1\\.shp$",
+                           recursive = TRUE))) {
+      msg("downloading the Geofabrik extract for ", iso)
+      ok <- try(download_resumable(
+        sprintf("https://download.geofabrik.de/africa/%s-latest-free.shp.zip", slug),
+        zipf, rounds = 30, min_bytes = 1e6), silent = TRUE)
+      if (inherits(ok, "try-error")) {
+        stop("Could not download the Geofabrik extract for ", iso, ". ",
+             "Fetch it manually with: wget -c ",
+             sprintf("https://download.geofabrik.de/africa/%s-latest-free.shp.zip", slug),
+             " and place it at ", zipf)
+      }
+      if (!is_zip_file(zipf)) stop("Geofabrik download is not a ZIP: ", zipf)
+      msg("unpacking ", basename(zipf))
+      utils::unzip(zipf, exdir = outd, overwrite = TRUE)
+    }
+    osm_layers[[iso]] <- outd
+  }
+
+  # Read only the required columns, only inside the domain box.
+  read_osm <- function(pattern, keep_cols, label) {
+    parts <- lapply(names(osm_layers), function(iso) {
+      f <- list.files(osm_layers[[iso]], pattern = pattern,
+                      full.names = TRUE, recursive = TRUE)
+      if (!length(f)) return(NULL)
+      msg("reading ", label, " for ", iso)
+      x <- try(sf::st_read(f[1], quiet = TRUE, wkt_filter = dom_box_wkt),
+               silent = TRUE)
+      if (inherits(x, "try-error")) {
+        msg("  wkt_filter not supported by the driver; reading in full")
+        x <- sf::st_read(f[1], quiet = TRUE)
+      }
+      if (nrow(x) == 0) return(NULL)
+      keep <- intersect(keep_cols, names(x))
+      x <- x[, keep]
+      x$iso3 <- iso
+      x
+    })
+    parts <- parts[!vapply(parts, is.null, logical(1))]
+    if (!length(parts)) return(NULL)
+    keep <- Reduce(intersect, lapply(parts, names))
+    out <- do.call(rbind, lapply(parts, function(z) z[, keep]))
+    rm(parts); gc()
+    sf::st_transform(out, 4326)
+  }
+
+  roads_all <- read_osm("gis_osm_roads_free_1\\.shp$", c("fclass"), "roads")
+  places    <- read_osm("gis_osm_places_free_1\\.shp$", c("fclass"), "places")
+  waters    <- read_osm("gis_osm_waterways_free_1\\.shp$", c("fclass"), "waterways")
+
+  clip_to_domain <- function(x) {
+    if (is.null(x) || nrow(x) == 0) return(NULL)
+    out <- sf::st_filter(x, dom_box)
+    if (nrow(out) == 0) NULL else out
+  }
+
+  roads_all   <- clip_to_domain(roads_all)
+  roads_major <- if (is.null(roads_all)) NULL else
+    roads_all[roads_all$fclass %in% major_classes, ]
+  places_pop  <- clip_to_domain(places)
+  places_pop  <- if (is.null(places_pop)) NULL else
+    places_pop[places_pop$fclass %in% c("city", "town", "village", "hamlet"), ]
+  rivers      <- clip_to_domain(waters)
+  rivers      <- if (is.null(rivers)) NULL else
+    rivers[rivers$fclass %in% c("river", "canal"), ]
+  rm(places, waters); gc()
+
+  for (nm in c("roads_all", "roads_major", "places_pop", "rivers")) {
+    x <- get(nm)
+    if (!is.null(x) && nrow(x) > 0)
+      sf::write_sf(x, osm_cache[[nm]], delete_dsn = TRUE)
+  }
+}
+
+# An empty layer would silently turn a distance covariate into all NA and drop
+# every cell from the model, so fail here with something readable.
+for (nm in c("roads_all", "places_pop", "rivers")) {
+  x <- get(nm)
+  if (is.null(x) || nrow(x) == 0) {
+    stop("OpenStreetMap layer '", nm, "' is empty over the study domain. ",
+         "Check that the Geofabrik archives unpacked into ", cfg$raw_dir)
+  }
+}
+for (nm in c("roads_all", "roads_major", "places_pop", "rivers")) {
+  x <- get(nm)
+  msg(nm, ": ", if (is.null(x)) 0 else nrow(x), " features")
+}
+gc()
+```
+
+# Rainfall from CHIRPS
+
+Monthly Africa rasters are small once cropped to the domain, so they are
+accumulated into a single numeric matrix rather than a list of 300 SpatRaster
+objects, each of which would otherwise leave a temporary file behind.
+
+```{r chirps}
+if (isTRUE(cfg$use_chirps)) {
+chirps_dir <- file.path(cfg$raw_dir, "chirps")
+dir.create(chirps_dir, showWarnings = FALSE, recursive = TRUE)
+
+chirps_stack_path <- file.path(cfg$proc_dir, "chirps_monthly_domain.tif")
+
+if (!validate_geotiff(chirps_stack_path)) {
+
+  chirps_url <- function(y, m) {
+    sprintf(paste0("https://data.chc.ucsb.edu/products/CHIRPS-2.0/",
+                   "africa_monthly/tifs/chirps-v2.0.%04d.%02d.tif.gz"), y, m)
+  }
+  chirps_file <- function(y, m) {
+    file.path(chirps_dir, sprintf("chirps-v2.0.%04d.%02d.tif.gz", y, m))
+  }
+
+  read_chirps_month <- function(y, m) {
+    dst <- chirps_file(y, m)
+    got <- try(download_file_safe(chirps_url(y, m), dst, tries = 2,
+                                  min_bytes = 1e5), silent = TRUE)
+    if (inherits(got, "try-error")) return(NULL)
+    r <- try(terra::rast(paste0("/vsigzip/", normalizePath(dst))), silent = TRUE)
+    if (inherits(r, "try-error")) { unlink(dst); return(NULL) }
+    rc <- try(terra::crop(r, dom_ext, snap = "out"), silent = TRUE)
+    if (inherits(rc, "try-error")) return(NULL)
+    rc
+  }
+
+  # Establish the template from the first month that is available.
+  tmpl <- NULL
+  for (y in cfg$chirps_years) {
+    for (m in 1:12) {
+      tmpl <- read_chirps_month(y, m)
+      if (!is.null(tmpl)) break
+    }
+    if (!is.null(tmpl)) break
+  }
+  if (is.null(tmpl)) stop("No CHIRPS month could be downloaded. Check network ",
+                          "access to data.chc.ucsb.edu, or set cfg$use_chirps ",
+                          "to FALSE.")
+  chirps_tmpl <- terra::rast(tmpl)   # geometry only
+  ncell_c <- terra::ncell(chirps_tmpl)
+  msg("CHIRPS domain window: ", terra::nrow(chirps_tmpl), " x ",
+      terra::ncol(chirps_tmpl), " cells")
+
+  n_slot <- 12L * length(cfg$chirps_years)
+  vals <- matrix(NA_real_, nrow = ncell_c, ncol = n_slot)
+  lyr_names <- character(n_slot)
+  k <- 0L
+
+  for (y in cfg$chirps_years) {
+    for (m in 1:12) {
+      rc <- read_chirps_month(y, m)
+      if (is.null(rc)) { msg("CHIRPS month unavailable, skipping: ", y, "-", m); next }
+      if (!terra::compareGeom(rc, chirps_tmpl, stopOnError = FALSE, messages = FALSE)) {
+        rc <- terra::resample(rc, chirps_tmpl, method = "bilinear")
+      }
+      v <- terra::values(rc)[, 1]
+      v[v < -100] <- NA_real_
+      k <- k + 1L
+      vals[, k] <- v
+      lyr_names[k] <- sprintf("p_%04d_%02d", y, m)
+      rm(rc, v)
+    }
+    msg("CHIRPS year ", y, " done (", k, " layers so far)")
+  }
+  if (k == 0L) stop("No CHIRPS layers were assembled.")
+
+  chirps_out <- terra::rast(chirps_tmpl, nlyrs = k)
+  terra::values(chirps_out) <- vals[, seq_len(k), drop = FALSE]
+  names(chirps_out) <- lyr_names[seq_len(k)]
+  terra::writeRaster(chirps_out, chirps_stack_path, overwrite = TRUE,
+                     datatype = "FLT4S", gdal = c("COMPRESS=LZW", "TILED=YES"))
+  rm(vals, chirps_out, tmpl, chirps_tmpl); sweep_temp()
+}
+chirps <- terra::rast(chirps_stack_path)
+msg("CHIRPS stack: ", terra::nlyr(chirps), " monthly layers")
+} else {
+  chirps <- NULL
+  msg("CHIRPS disabled by configuration.")
+}
+```
+
+# Baseline forest and peat masks
+
+Both masks are used in every counting pass, so each is built once with a
+single streaming operation and stored as a one-byte compressed GeoTIFF.
+
+```{r base-masks}
+agg_fact <- as.integer(round(cfg$grid_deg / terra::res(lossyear)[1]))
+stopifnot(agg_fact >= 2)
+msg("Aggregation factor: ", agg_fact, " (cell size ", cfg$grid_deg, " deg)")
+
+forest_path  <- file.path(cfg$proc_dir, "forest2000_30m.tif")
+peatbin_path <- file.path(cfg$proc_dir, "peat_binary_30m.tif")
+
+.fthresh  <- cfg$forest_thresh
+.fclasses <- cfg$forest_classes
+.pclass   <- cfg$peat_class
+
+if (!cached_ok(forest_path, ref = lossyear, nlyr = 1, label = "forest2000_30m.tif")) {
+  msg("building the baseline forest mask")
+  if (have_treecover) {
+    terra::lapp(c(treecover, peat30),
+                fun = function(tc, pc) {
+                  as.integer(!is.na(tc) & !is.na(pc) &
+                               tc >= .fthresh & pc %in% .fclasses)
+                },
+                filename = forest_path, overwrite = TRUE, wopt = wopt_int)
+  } else {
+    terra::lapp(peat30,
+                fun = function(pc) as.integer(!is.na(pc) & pc %in% .fclasses),
+                filename = forest_path, overwrite = TRUE, wopt = wopt_int)
+  }
+  sweep_temp()
+}
+forest30 <- terra::rast(forest_path); names(forest30) <- "forest2000"
+
+if (!cached_ok(peatbin_path, ref = lossyear, nlyr = 1, label = "peat_binary_30m.tif")) {
+  msg("building the peat swamp forest mask")
+  terra::lapp(peat30,
+              fun = function(pc) as.integer(!is.na(pc) & pc == .pclass),
+              filename = peatbin_path, overwrite = TRUE, wopt = wopt_int)
+  sweep_temp()
+}
+peat_bin30 <- terra::rast(peatbin_path); names(peat_bin30) <- "peat"
+
+y_lo_rec <- cfg$recent_window[1] - 2000L
+y_hi_rec <- cfg$recent_window[2] - 2000L
+n_years  <- as.integer(cfg$year_max - 2000L)
+```
+
+# Streaming count engine
+
+This replaces the whole-raster terra passes of V5. One pass over the 30 m
+grid produces every count the analysis needs: baseline forest, peat, peat
+forest, the annual loss and fire counts for each year from 2001 to
+`r cfg$year_max`, and the non-fire counts for each analysis window. Peak
+memory is a slab of `r cfg$block_rows_target` raster rows across four layers.
+
+```{r block-engine}
+# ---------------------------------------------------------------------------
+# count_blockwise()
+#
+# Reads lossyear, fireyear, the forest mask and the peat mask in horizontal
+# slabs and tabulates counts directly into small accumulator arrays. Values
+# are identical to terra::aggregate(fun = "sum") on the same masks; this is
+# checked against terra in the verification chunk below.
+#
+# Returns a list of matrices with dim (grid rows, grid cols) and arrays with
+# dim (grid rows, grid cols, years).
+# ---------------------------------------------------------------------------
+
+count_blockwise <- function(fact,
+                            r_loss = lossyear, r_fire = fireyear,
+                            r_forest = forest30, r_peat = peat_bin30,
+                            label = "grid counts", quiet = FALSE) {
+
+  nr <- terra::nrow(r_loss); nc <- terra::ncol(r_loss)
+  nyr <- n_years
+
+  ngr <- as.integer(ceiling(nr / fact))
+  ngc <- as.integer(ceiling(nc / fact))
+  gcol <- ((seq_len(nc) - 1L) %/% fact) + 1L
+
+  # Slab height must divide the aggregation factor so a slab never straddles
+  # two grid rows.
+  divs   <- seq_len(fact)[fact %% seq_len(fact) == 0L]
+  target <- max(1L, min(fact, cfg$block_rows_target))
+  rpc    <- max(divs[divs <= target])
+
+  win <- list(
+    rec  = c(cfg$recent_window[1] - 2000L, cfg$recent_window[2] - 2000L),
+    base = c(cfg$base_window[1]   - 2000L, cfg$base_window[2]   - 2000L),
+    all  = c(1L, nyr)
+  )
+
+  base_forest <- matrix(0, ngr, ngc)
+  base_peat   <- matrix(0, ngr, ngc)
+  base_pf     <- matrix(0, ngr, ngc)
+  ann_loss <- array(0, c(ngr, ngc, nyr))
+  ann_fire <- array(0, c(ngr, ngc, nyr))
+  ann_lp   <- array(0, c(ngr, ngc, nyr))
+  ann_fp   <- array(0, c(ngr, ngc, nyr))
+  nonfire  <- lapply(win, function(z) matrix(0, ngr, ngc))
+
+  terra::readStart(r_loss); terra::readStart(r_fire)
+  terra::readStart(r_forest); terra::readStart(r_peat)
+  on.exit({
+    try(terra::readStop(r_loss), silent = TRUE)
+    try(terra::readStop(r_fire), silent = TRUE)
+    try(terra::readStop(r_forest), silent = TRUE)
+    try(terra::readStop(r_peat), silent = TRUE)
+  }, add = TRUE)
+
+  gv_cache <- list()
+  t0 <- Sys.time()
+
+  for (b in seq_len(ngr)) {
+    r_start <- (b - 1L) * fact + 1L
+    r_end   <- min(b * fact, nr)
+    rr <- r_start
+
+    acc_forest <- numeric(ngc); acc_peat <- numeric(ngc); acc_pf <- numeric(ngc)
+    acc_loss <- matrix(0, ngc, nyr); acc_fire <- matrix(0, ngc, nyr)
+    acc_lp   <- matrix(0, ngc, nyr); acc_fp   <- matrix(0, ngc, nyr)
+    acc_nf   <- lapply(win, function(z) numeric(ngc))
+
+    while (rr <= r_end) {
+      nsub <- min(rpc, r_end - rr + 1L)
+      key <- as.character(nsub)
+      if (is.null(gv_cache[[key]])) gv_cache[[key]] <- rep.int(gcol, nsub)
+      gv <- gv_cache[[key]]
+
+      Lv <- terra::readValues(r_loss,   row = rr, nrows = nsub, col = 1, ncols = nc)
+      Fv <- terra::readValues(r_fire,   row = rr, nrows = nsub, col = 1, ncols = nc)
+      Ov <- terra::readValues(r_forest, row = rr, nrows = nsub, col = 1, ncols = nc)
+      Pv <- terra::readValues(r_peat,   row = rr, nrows = nsub, col = 1, ncols = nc)
+
+      # NA outside the domain means "no loss" and "not forest".
+      Lv[is.na(Lv)] <- 0; Fv[is.na(Fv)] <- 0
+      Ov[is.na(Ov)] <- 0; Pv[is.na(Pv)] <- 0
+      Lv <- as.integer(Lv); Fv <- as.integer(Fv)
+      fo <- Ov > 0.5; pe <- Pv > 0.5
+      rm(Ov, Pv)
+
+      acc_forest <- acc_forest + tabulate(gv[fo], nbins = ngc)
+      acc_peat   <- acc_peat   + tabulate(gv[pe], nbins = ngc)
+      fp <- fo & pe
+      acc_pf     <- acc_pf     + tabulate(gv[fp], nbins = ngc)
+
+      selL <- fo & Lv >= 1L & Lv <= nyr
+      if (any(selL)) {
+        k <- (Lv[selL] - 1L) * ngc + gv[selL]
+        acc_loss <- acc_loss + matrix(tabulate(k, nbins = ngc * nyr), ngc, nyr)
+        selLP <- selL & pe
+        if (any(selLP)) {
+          k <- (Lv[selLP] - 1L) * ngc + gv[selLP]
+          acc_lp <- acc_lp + matrix(tabulate(k, nbins = ngc * nyr), ngc, nyr)
+        }
+      }
+      selF <- fo & Fv >= 1L & Fv <= nyr
+      if (any(selF)) {
+        k <- (Fv[selF] - 1L) * ngc + gv[selF]
+        acc_fire <- acc_fire + matrix(tabulate(k, nbins = ngc * nyr), ngc, nyr)
+        selFP <- selF & pe
+        if (any(selFP)) {
+          k <- (Fv[selFP] - 1L) * ngc + gv[selFP]
+          acc_fp <- acc_fp + matrix(tabulate(k, nbins = ngc * nyr), ngc, nyr)
+        }
+      }
+
+      # Non-fire loss is computed explicitly rather than as loss minus fire,
+      # so the result does not depend on fire being a strict subset of loss.
+      for (w in names(win)) {
+        lo <- win[[w]][1]; hi <- win[[w]][2]
+        s <- fo & (Lv >= lo & Lv <= hi) & !(Fv >= lo & Fv <= hi)
+        if (any(s)) acc_nf[[w]] <- acc_nf[[w]] + tabulate(gv[s], nbins = ngc)
+      }
+
+      rm(Lv, Fv, fo, pe, fp, selL, selF)
+      rr <- rr + nsub
+    }
+
+    base_forest[b, ] <- acc_forest
+    base_peat[b, ]   <- acc_peat
+    base_pf[b, ]     <- acc_pf
+    ann_loss[b, , ]  <- acc_loss
+    ann_fire[b, , ]  <- acc_fire
+    ann_lp[b, , ]    <- acc_lp
+    ann_fp[b, , ]    <- acc_fp
+    for (w in names(win)) nonfire[[w]][b, ] <- acc_nf[[w]]
+
+    if (!quiet && (b %% 10L == 0L || b == ngr)) {
+      el <- as.numeric(difftime(Sys.time(), t0, units = "mins"))
+      msg(sprintf("%s: grid row %d of %d (%.1f min elapsed, about %.1f min left)",
+                  label, b, ngr, el, el / b * (ngr - b)))
+    }
+  }
+
+  sum_years <- function(A, lo, hi) {
+    idx <- seq.int(max(1L, lo), min(nyr, hi))
+    if (length(idx) == 1L) A[, , idx] else apply(A[, , idx, drop = FALSE], c(1, 2), sum)
+  }
+
+  out <- list(
+    fact = fact, ngr = ngr, ngc = ngc, nyr = nyr,
+    n_forest = base_forest, n_peat = base_peat, n_peat_forest = base_pf,
+    ann_loss = ann_loss, ann_fire = ann_fire,
+    ann_loss_peat = ann_lp, ann_fire_peat = ann_fp
+  )
+  for (w in names(win)) {
+    lo <- win[[w]][1]; hi <- win[[w]][2]
+    out[[paste0("n_loss_", w)]]      <- sum_years(ann_loss, lo, hi)
+    out[[paste0("n_fire_", w)]]      <- sum_years(ann_fire, lo, hi)
+    out[[paste0("n_loss_peat_", w)]] <- sum_years(ann_lp,   lo, hi)
+    out[[paste0("n_fire_peat_", w)]] <- sum_years(ann_fp,   lo, hi)
+    out[[paste0("n_nonfire_", w)]]   <- nonfire[[w]]
+  }
+  out
+}
+
+# Turn an accumulator matrix into a SpatRaster on the aggregated grid.
+grid_extent_for <- function(fact, ref = lossyear) {
+  ngr <- ceiling(terra::nrow(ref) / fact)
+  ngc <- ceiling(terra::ncol(ref) / fact)
+  rx  <- terra::xres(ref); ry <- terra::yres(ref)
+  terra::ext(terra::xmin(ref), terra::xmin(ref) + ngc * fact * rx,
+             terra::ymax(ref) - ngr * fact * ry, terra::ymax(ref))
+}
+
+mat_to_grid <- function(M, fact, ref = lossyear) {
+  r <- terra::rast(nrows = nrow(M), ncols = ncol(M),
+                   extent = grid_extent_for(fact, ref), crs = terra::crs(ref))
+  terra::values(r) <- as.vector(t(M))
+  r
+}
+```
+
+```{r block-engine-verification}
+# Run both engines on an aligned sub-window and require an exact match before
+# the block engine is trusted for the full domain.
+verify_block_engine <- function(fact = agg_fact) {
+  nw <- min(as.integer(cfg$verify_window_cells), 6L)
+  nr <- terra::nrow(lossyear); nc <- terra::ncol(lossyear)
+  rx <- terra::xres(lossyear); ry <- terra::yres(lossyear)
+  ngr <- ceiling(nr / fact); ngc <- ceiling(nc / fact)
+
+  b0 <- max(1L, as.integer(floor(ngr / 2)) - nw %/% 2L)
+  c0 <- max(1L, as.integer(floor(ngc / 2)) - nw %/% 2L)
+  r1 <- (b0 - 1L) * fact + 1L; r2 <- min(nr, (b0 + nw - 1L) * fact)
+  c1 <- (c0 - 1L) * fact + 1L; c2 <- min(nc, (c0 + nw - 1L) * fact)
+
+  e <- terra::ext(terra::xFromCol(lossyear, c1) - rx / 2,
+                  terra::xFromCol(lossyear, c2) + rx / 2,
+                  terra::yFromRow(lossyear, r2) - ry / 2,
+                  terra::yFromRow(lossyear, r1) + ry / 2)
+
+  L <- terra::crop(lossyear, e);   Fr <- terra::crop(fireyear, e)
+  Fo <- terra::crop(forest30, e);  Pe <- terra::crop(peat_bin30, e)
+
+  bl <- count_blockwise(fact, L, Fr, Fo, Pe, label = "verification", quiet = TRUE)
+
+  fo <- na0(Fo == 1); pe <- na0(Pe == 1)
+  a_forest <- terra::aggregate(fo, fact, fun = "sum")
+  a_pf     <- terra::aggregate(na0(fo & pe), fact, fun = "sum")
+  fire_w   <- na0((Fr >= y_lo_rec) & (Fr <= y_hi_rec) & (fo == 1))
+  a_fire   <- terra::aggregate(fire_w, fact, fun = "sum")
+  loss_w   <- na0((L >= y_lo_rec) & (L <= y_hi_rec) & (fo == 1))
+  a_nonf   <- terra::aggregate(na0(loss_w & (fire_w == 0)), fact, fun = "sum")
+  yr_test  <- min(n_years, 24L)
+  a_yr     <- terra::aggregate(na0((L == yr_test) & (fo == 1)), fact, fun = "sum")
+
+  cmp <- function(mat, rst, nm) {
+    a <- as.vector(t(mat))
+    b <- as.vector(terra::values(rst))
+    b[is.na(b)] <- 0
+    if (length(a) != length(b)) return(sprintf("%s: length %d vs %d", nm, length(a), length(b)))
+    d <- max(abs(a - b))
+    if (d > 1e-6) sprintf("%s: max absolute difference %g", nm, d) else NA_character_
+  }
+
+  probs <- c(
+    cmp(bl$n_forest,       a_forest, "n_forest"),
+    cmp(bl$n_peat_forest,  a_pf,     "n_peat_forest"),
+    cmp(bl$n_fire_rec,     a_fire,   "n_fire_rec"),
+    cmp(bl$n_nonfire_rec,  a_nonf,   "n_nonfire_rec"),
+    cmp(bl$ann_loss[, , yr_test], a_yr, paste0("annual loss ", 2000L + yr_test))
+  )
+  probs <- probs[!is.na(probs)]
+
+  rm(L, Fr, Fo, Pe, fo, pe, fire_w, loss_w, a_forest, a_pf, a_fire, a_nonf, a_yr)
+  sweep_temp()
+
+  if (length(probs)) {
+    msg("Block engine verification FAILED: ", paste(probs, collapse = "; "))
+    FALSE
+  } else {
+    msg("Block engine verified against terra::aggregate on a ", nw, " by ", nw,
+        " cell window. Counts match exactly.")
+    TRUE
+  }
+}
+
+if (isTRUE(cfg$verify_block_engine)) {
+  block_engine_ok <- isTRUE(try(verify_block_engine(agg_fact), silent = TRUE))
+  if (!block_engine_ok) {
+    warning("The streaming count engine did not reproduce terra::aggregate. ",
+            "Falling back to the slower whole-raster terra path.")
+  }
+} else {
+  block_engine_ok <- TRUE
+  msg("Block engine verification skipped by configuration.")
+}
+```
+
+# Analysis grid and pixel counts
+
+```{r grid-counts}
+grid_path   <- file.path(cfg$proc_dir, "grid_counts.tif")
+annual_path <- file.path(cfg$proc_dir, "grid_annual_counts.tif")
+
+grid_layer_names <- c(
+  "n_forest", "n_peat", "n_peat_forest",
+  paste0(c("n_loss", "n_fire", "n_nonfire", "n_loss_peat", "n_fire_peat"), "_rec"),
+  paste0(c("n_loss", "n_fire", "n_nonfire", "n_loss_peat", "n_fire_peat"), "_base"),
+  paste0(c("n_loss", "n_fire", "n_nonfire", "n_loss_peat", "n_fire_peat"), "_all")
+)
+annual_layer_names <- as.vector(vapply(
+  cfg$year_min:cfg$year_max,
+  function(y) sprintf(c("loss_%d", "fire_%d", "losspeat_%d", "firepeat_%d"), y),
+  character(4)))
+
+# Whole-raster terra path, used only if the streaming engine fails verification.
+count_terra_fallback <- function(fact) {
+  msg("Using the whole-raster terra counting path. This is slower and needs ",
+      "more scratch space.")
+  as_mat <- function(r) {
+    matrix(as.vector(terra::values(r)), nrow = terra::nrow(r),
+           ncol = terra::ncol(r), byrow = TRUE)
+  }
+  agg_mask <- function(expr, nm) {
+    f1 <- scratch(paste0("fb_mask_", nm, ".tif"))
+    f2 <- scratch(paste0("fb_agg_", nm, ".tif"))
+    terra::ifel(is.na(expr), 0, expr, filename = f1, overwrite = TRUE, wopt = wopt_int)
+    terra::aggregate(terra::rast(f1), fact, fun = "sum",
+                     filename = f2, overwrite = TRUE, wopt = wopt_flt)
+    M <- as_mat(terra::rast(f2))
+    drop_scratch(c(f1, f2)); sweep_temp()
+    M
+  }
+  ngr <- ceiling(terra::nrow(lossyear) / fact)
+  ngc <- ceiling(terra::ncol(lossyear) / fact)
+  out <- list(fact = fact, ngr = ngr, ngc = ngc, nyr = n_years)
+  out$n_forest      <- agg_mask(forest30 == 1, "forest")
+  out$n_peat        <- agg_mask(peat_bin30 == 1, "peat")
+  out$n_peat_forest <- agg_mask((forest30 == 1) & (peat_bin30 == 1), "peatforest")
+
+  ann_loss <- array(0, c(ngr, ngc, n_years)); ann_fire <- ann_loss
+  ann_lp   <- ann_loss; ann_fp <- ann_loss
+  for (y in cfg$year_min:cfg$year_max) {
+    k <- y - 2000L
+    msg("fallback annual counts ", y)
+    ann_loss[, , k] <- agg_mask((lossyear == k) & (forest30 == 1), paste0("l", k))
+    ann_fire[, , k] <- agg_mask((fireyear == k) & (forest30 == 1), paste0("f", k))
+    ann_lp[, , k]   <- agg_mask((lossyear == k) & (forest30 == 1) & (peat_bin30 == 1), paste0("lp", k))
+    ann_fp[, , k]   <- agg_mask((fireyear == k) & (forest30 == 1) & (peat_bin30 == 1), paste0("fp", k))
+  }
+  out$ann_loss <- ann_loss; out$ann_fire <- ann_fire
+  out$ann_loss_peat <- ann_lp; out$ann_fire_peat <- ann_fp
+
+  win <- list(rec  = c(y_lo_rec, y_hi_rec),
+              base = c(cfg$base_window[1] - 2000L, cfg$base_window[2] - 2000L),
+              all  = c(1L, n_years))
+  sum_years <- function(A, lo, hi) {
+    idx <- seq.int(max(1L, lo), min(n_years, hi))
+    if (length(idx) == 1L) A[, , idx] else apply(A[, , idx, drop = FALSE], c(1, 2), sum)
+  }
+  for (w in names(win)) {
+    lo <- win[[w]][1]; hi <- win[[w]][2]
+    out[[paste0("n_loss_", w)]]      <- sum_years(ann_loss, lo, hi)
+    out[[paste0("n_fire_", w)]]      <- sum_years(ann_fire, lo, hi)
+    out[[paste0("n_loss_peat_", w)]] <- sum_years(ann_lp,   lo, hi)
+    out[[paste0("n_fire_peat_", w)]] <- sum_years(ann_fp,   lo, hi)
+    out[[paste0("n_nonfire_", w)]]   <- agg_mask(
+      (lossyear >= lo) & (lossyear <= hi) & (forest30 == 1) &
+        !((fireyear >= lo) & (fireyear <= hi)), paste0("nf_", w))
+  }
+  out
+}
+
+need_counts <- !(cached_ok(grid_path, nlyr = length(grid_layer_names),
+                           label = "grid_counts.tif") &&
+                 cached_ok(annual_path, nlyr = length(annual_layer_names),
+                           label = "grid_annual_counts.tif"))
+
+if (need_counts) {
+  t_start <- Sys.time()
+  cnt <- if (block_engine_ok) count_blockwise(agg_fact, label = "grid counts") else
+    count_terra_fallback(agg_fact)
+  msg("counting pass finished in ",
+      round(as.numeric(difftime(Sys.time(), t_start, units = "mins")), 1), " minutes")
+
+  grid_mats <- list(
+    cnt$n_forest, cnt$n_peat, cnt$n_peat_forest,
+    cnt$n_loss_rec, cnt$n_fire_rec, cnt$n_nonfire_rec,
+    cnt$n_loss_peat_rec, cnt$n_fire_peat_rec,
+    cnt$n_loss_base, cnt$n_fire_base, cnt$n_nonfire_base,
+    cnt$n_loss_peat_base, cnt$n_fire_peat_base,
+    cnt$n_loss_all, cnt$n_fire_all, cnt$n_nonfire_all,
+    cnt$n_loss_peat_all, cnt$n_fire_peat_all
+  )
+  stopifnot(length(grid_mats) == length(grid_layer_names))
+  gc_stack <- terra::rast(lapply(grid_mats, mat_to_grid, fact = agg_fact))
+  names(gc_stack) <- grid_layer_names
+  terra::writeRaster(gc_stack, grid_path, overwrite = TRUE,
+                     datatype = "FLT4S", gdal = c("COMPRESS=LZW", "TILED=YES"))
+  rm(grid_mats, gc_stack); gc()
+
+  ann_list <- vector("list", 4L * n_years)
+  i <- 0L
+  for (y in cfg$year_min:cfg$year_max) {
+    k <- y - 2000L
+    ann_list[[i + 1L]] <- mat_to_grid(cnt$ann_loss[, , k],      agg_fact)
+    ann_list[[i + 2L]] <- mat_to_grid(cnt$ann_fire[, , k],      agg_fact)
+    ann_list[[i + 3L]] <- mat_to_grid(cnt$ann_loss_peat[, , k], agg_fact)
+    ann_list[[i + 4L]] <- mat_to_grid(cnt$ann_fire_peat[, , k], agg_fact)
+    i <- i + 4L
+  }
+  ann_stack <- terra::rast(ann_list)
+  names(ann_stack) <- annual_layer_names
+  terra::writeRaster(ann_stack, annual_path, overwrite = TRUE,
+                     datatype = "FLT4S", gdal = c("COMPRESS=LZW", "TILED=YES"))
+  rm(ann_list, ann_stack, cnt); sweep_temp()
+}
+
+grid_counts <- terra::rast(grid_path)
+names(grid_counts) <- grid_layer_names
+annual_counts <- terra::rast(annual_path)
+names(annual_counts) <- annual_layer_names
+
+npix <- agg_fact^2
+template <- grid_counts[[1]]
+msg("Analysis grid: ", terra::nrow(template), " x ", terra::ncol(template),
+    " cells; annual layers: ", terra::nlyr(annual_counts))
+sweep_temp()
+```
+
+# Distance machinery
+
+Two safe distance routines replace the terra calls that could exhaust memory
+in native code.
+
+`distance_to_vector_stripwise()` computes distance from an analysis grid to a
+vector layer in horizontal strips. Every strip is compared against the whole
+vector, so the result is identical to computing the grid in one call, but no
+single terra call ever sees more than a few thousand cells.
+
+`peat_edge_distance()` computes distance to the peat swamp forest edge at the
+native CongoPeat resolution by streaming, and is described in detail below.
+
+```{r distance-machinery}
+# ---------------------------------------------------------------------------
+# Distance from a raster grid to a vector layer, computed in strips
+# ---------------------------------------------------------------------------
+
+distance_to_vector_stripwise <- function(tmpl, vec_sf, out_path, label,
+                                         rows_per = 20L) {
+  nr <- terra::nrow(tmpl); nc <- terra::ncol(tmpl)
+  ry <- terra::yres(tmpl)
+  v  <- terra::vect(vec_sf)
+  msg("[distance] ", label, ": ", nrow(vec_sf), " features, ", nr,
+      " rows in strips of ", rows_per)
+
+  res <- numeric(nr * nc)
+  rr <- 1L; done <- 0L
+  while (rr <= nr) {
+    nsub <- min(rows_per, nr - rr + 1L)
+    e <- terra::ext(terra::xmin(tmpl), terra::xmax(tmpl),
+                    terra::yFromRow(tmpl, rr + nsub - 1L) - ry / 2,
+                    terra::yFromRow(tmpl, rr) + ry / 2)
+    strip <- terra::crop(terra::setValues(tmpl, NA_real_), e)
+    d <- terra::distance(strip, v)
+    res[((rr - 1L) * nc + 1L):((rr - 1L + nsub) * nc)] <- as.vector(terra::values(d))
+    rm(strip, d)
+    rr <- rr + nsub; done <- done + 1L
+    if (done %% 5L == 0L) msg("[distance] ", label, ": row ", rr - 1L, " of ", nr)
+  }
+  rm(v); gc()
+
+  out <- terra::rast(tmpl)
+  terra::values(out) <- res / 1000
+  names(out) <- label
+  terra::writeRaster(out, out_path, overwrite = TRUE,
+                     datatype = "FLT4S", gdal = c("COMPRESS=LZW"))
+  rm(res, out); gc()
+  msg("[distance] ", label, ": written to ", out_path)
+  terra::rast(out_path)
+}
+
+# ---------------------------------------------------------------------------
+# Fast distance from a raster grid to a vector layer
+#
+# The line layers are densified so that no segment is longer than
+# distance_vertex_m, their vertices go into a k-d tree, and every grid cell
+# centre is matched to its nearest vertices. The reported value is then the
+# true geodesic distance to the best of those candidates.
+#
+# This is an approximation to the distance to the nearest point on a segment,
+# bounded above by half the densification interval, so 50 m at the default
+# setting. The covariate is measured in kilometres on 5.5 km cells and enters
+# the models as log1p(km), so a 50 m ceiling is immaterial. The exact
+# alternative is available through cfg$distance_method = "exact", but on a
+# 63,000 feature road layer it runs for many hours.
+# ---------------------------------------------------------------------------
+
+# Densification is done on the coordinate matrix rather than with
+# sf::st_segmentize(). For geographic coordinates that function dispatches to
+# lwgeom, which is an optional sf dependency that needs liblwgeom and is
+# frequently absent on macOS. Interpolating linearly in lon/lat along segments
+# no longer than 100 m is indistinguishable from geodesic interpolation at
+# this scale, and it removes the dependency entirely.
+vector_reference_points <- function(vec_sf, interval_m = 100) {
+  g  <- sf::st_geometry(vec_sf)
+  cc <- sf::st_coordinates(g)
+  rm(g)
+
+  X <- as.numeric(cc[, "X"]); Y <- as.numeric(cc[, "Y"])
+  grp_cols <- setdiff(colnames(cc), c("X", "Y", "Z", "M"))
+
+  keep <- !is.na(X) & !is.na(Y)
+  base_pts <- cbind(X[keep], Y[keep])
+
+  # Point layers have no path structure, so there is nothing to densify.
+  if (!length(grp_cols) || nrow(cc) < 2L) {
+    rm(cc, X, Y); gc()
+    return(base_pts)
+  }
+
+  grp <- do.call(paste, c(as.data.frame(cc[, grp_cols, drop = FALSE]), sep = "_"))
+  rm(cc)
+
+  n <- length(X)
+  same <- grp[-n] == grp[-1] & !is.na(X[-n]) & !is.na(X[-1]) &
+    !is.na(Y[-n]) & !is.na(Y[-1])
+  rm(grp)
+  if (!any(same)) { rm(X, Y); gc(); return(base_pts) }
+
+  x1 <- X[-n][same]; y1 <- Y[-n][same]
+  x2 <- X[-1][same]; y2 <- Y[-1][same]
+  rm(X, Y, same, keep); gc()
+
+  # Segment length in metres, using a local equirectangular scale.
+  kx <- 111320 * cos((y1 + y2) / 2 * pi / 180)
+  ky <- 110574
+  seg_m <- sqrt(((x2 - x1) * kx)^2 + ((y2 - y1) * ky)^2)
+  nseg  <- pmax(1L, as.integer(ceiling(seg_m / interval_m)))
+  rm(kx, seg_m)
+
+  add <- nseg - 1L
+  keep_seg <- add > 0L
+  if (!any(keep_seg)) {
+    rm(x1, y1, x2, y2, nseg, add); gc()
+    return(base_pts)
+  }
+
+  idx <- rep(which(keep_seg), add[keep_seg])
+  tt  <- sequence(add[keep_seg]) / rep(nseg[keep_seg], add[keep_seg])
+  newx <- x1[idx] + (x2[idx] - x1[idx]) * tt
+  newy <- y1[idx] + (y2[idx] - y1[idx]) * tt
+  rm(x1, y1, x2, y2, nseg, add, keep_seg, idx, tt); gc()
+
+  out <- rbind(base_pts, cbind(newx, newy))
+  rm(base_pts, newx, newy); gc()
+  out[!is.na(out[, 1]) & !is.na(out[, 2]), , drop = FALSE]
+}
+
+distance_to_vector_fast <- function(tmpl, vec_sf, out_path, label,
+                                    interval_m = 100, k = 3L) {
+  msg("[distance] ", label, ": densifying ", nrow(vec_sf), " features to ",
+      interval_m, " m")
+  P <- vector_reference_points(vec_sf, interval_m)
+  if (!nrow(P)) stop("[distance] ", label, ": no reference vertices produced.")
+  msg("[distance] ", label, ": ", nrow(P), " reference vertices; building k-d tree")
+
+  kx <- 111320; ky <- 110574
+  ref_metric <- cbind(P[, 1] * kx, P[, 2] * ky)
+  storage.mode(ref_metric) <- "double"
+  nn <- nn_index_builder(ref_metric, backend = .nn_backend_selected)
+  rm(ref_metric); gc()
+  msg("[distance] ", label, ": querying ", terra::ncell(tmpl),
+      " cells with the ", nn$backend, " backend")
+
+  # There are only about 25,000 analysis-grid cells, so one query is both
+  # smaller and safer than repeatedly rebuilding an RANN/FNN tree in chunks.
+  # The wrapper has already normalised and validated the return type.
+  xy <- terra::xyFromCell(tmpl, seq_len(terra::ncell(tmpl)))
+  q_metric <- cbind(xy[, 1] * kx, xy[, 2] * ky)
+  storage.mode(q_metric) <- "double"
+  idx <- nn$query(q_metric, min(as.integer(k), nrow(P)))
+  rm(nn, q_metric); gc()
+  dmin <- rep(Inf, nrow(xy))
+  for (j in seq_len(ncol(idx))) {
+    dj <- terra::distance(xy, P[idx[, j], , drop = FALSE],
+                          lonlat = TRUE, pairwise = TRUE)
+    dmin <- pmin(dmin, dj)
+    rm(dj)
+  }
+  rm(idx, P); gc()
+
+  out <- terra::rast(tmpl)
+  terra::values(out) <- dmin / 1000
+  names(out) <- label
+  terra::writeRaster(out, out_path, overwrite = TRUE,
+                     datatype = "FLT4S", gdal = c("COMPRESS=LZW"))
+  rm(dmin, out, xy); gc()
+  msg("[distance] ", label, ": written to ", out_path)
+  terra::rast(out_path)
+}
+
+# A small sidecar file records which method produced a cached distance raster,
+# so mixing methods across covariates cannot happen silently.
+method_tag   <- function(path) paste0(path, ".method")
+read_method  <- function(path) {
+  f <- method_tag(path)
+  if (file.exists(f)) tryCatch(readLines(f, warn = FALSE)[1],
+                               error = function(e) NA_character_) else NA_character_
+}
+write_method <- function(path, m) {
+  writeLines(paste0(m, " interval_m=", cfg$distance_vertex_m), method_tag(path))
+  invisible(path)
+}
+current_method_string <- function() {
+  paste0(cfg$distance_method, " interval_m=", cfg$distance_vertex_m)
+}
+
+build_distance_raster <- function(tmpl, vec_sf, out_path, label) {
+  r <- if (identical(cfg$distance_method, "exact")) {
+    distance_to_vector_stripwise(tmpl, vec_sf, out_path, label)
+  } else {
+    distance_to_vector_fast(tmpl, vec_sf, out_path, label,
+                            interval_m = cfg$distance_vertex_m)
+  }
+  write_method(out_path, cfg$distance_method)
+  r
+}
+
+# ---------------------------------------------------------------------------
+# Nearest-neighbour backend
+#
+# nn_index_builder(), output normalisation, package fallback and the functional
+# self-test are defined in the package preflight chunk above. Keeping one
+# central implementation ensures the road/rivers/settlements and peat-edge
+# calculations cannot drift onto different untested backend APIs.
+# ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# Inner boundary cells of the peat swamp forest class, extracted by streaming
+#
+# A cell is an inner boundary cell when it belongs to the peat class and at
+# least one of its eight neighbours does not. That is the same rule as
+# terra::boundaries(inner = TRUE, classes = FALSE, directions = 8). Slabs are
+# read with a one row halo so the test is correct across slab joins, and only
+# the coordinates of the boundary cells are kept.
+# ---------------------------------------------------------------------------
+
+peat_edge_points <- function(pr, pclass, rows_per = 200L) {
+  nr <- terra::nrow(pr); nc <- terra::ncol(pr)
+  xs <- terra::xFromCol(pr, seq_len(nc))
+  terra::readStart(pr)
+  on.exit(try(terra::readStop(pr), silent = TRUE), add = TRUE)
+
+  acc <- list(); rr <- 1L; done <- 0L
+  while (rr <= nr) {
+    nsub <- min(rows_per, nr - rr + 1L)
+    r0 <- max(1L, rr - 1L)
+    r1 <- min(nr, rr + nsub)
+    v <- terra::readValues(pr, row = r0, nrows = r1 - r0 + 1L, col = 1, ncols = nc)
+    v[is.na(v)] <- -1
+    M <- matrix(as.integer(v == pclass), nrow = nc)   # columns are raster rows
+    rm(v)
+    nrr <- ncol(M)
+
+    P <- matrix(0L, nc + 2L, nrr + 2L)
+    P[2:(nc + 1L), 2:(nrr + 1L)] <- M
+    S <- P[1:nc, 1:nrr] + P[2:(nc + 1L), 1:nrr] + P[3:(nc + 2L), 1:nrr] +
+         P[1:nc, 2:(nrr + 1L)] + P[2:(nc + 1L), 2:(nrr + 1L)] +
+         P[3:(nc + 2L), 2:(nrr + 1L)] +
+         P[1:nc, 3:(nrr + 2L)] + P[2:(nc + 1L), 3:(nrr + 2L)] +
+         P[3:(nc + 2L), 3:(nrr + 2L)]
+    rm(P)
+    B <- (M == 1L) & (S < 9L)
+    rm(M, S)
+
+    keep_lo <- rr - r0 + 1L
+    B <- B[, keep_lo:(keep_lo + nsub - 1L), drop = FALSE]
+    idx <- which(B)
+    rm(B)
+    if (length(idx)) {
+      ci <- ((idx - 1L) %% nc) + 1L
+      ri <- ((idx - 1L) %/% nc) + rr
+      acc[[length(acc) + 1L]] <- cbind(xs[ci], terra::yFromRow(pr, ri))
+      rm(ci, ri)
+    }
+    rm(idx)
+    rr <- rr + nsub; done <- done + 1L
+    if (done %% 10L == 0L) msg("[peat-edge] boundary scan: row ", rr - 1L, " of ", nr)
+  }
+  if (!length(acc)) return(matrix(numeric(0), ncol = 2))
+  out <- do.call(rbind, acc)
+  rm(acc); gc()
+  out
+}
+
+# ---------------------------------------------------------------------------
+# Distance to the peat edge, streamed, and averaged onto the analysis grid
+#
+# For every 100 m cell the nearest boundary points are found with a k-d tree
+# built in a local equirectangular metric, then the true geodesic distance to
+# those candidates is computed and the smallest is taken. Ranking in the local
+# metric is safe here: the domain sits within 3.5 degrees of the equator, so
+# east-west scale distortion is under 0.2 per cent, and k candidates are
+# checked geodesically rather than one.
+#
+# The analysis grid value is the mean of the 100 m distances whose cell centre
+# falls in that grid cell, accumulated during the same pass.
+# ---------------------------------------------------------------------------
+
+peat_edge_distance <- function(pr, tmpl, edge_lonlat, out100 = NULL,
+                               rows_per = 200L, k = 2L) {
+  nr <- terra::nrow(pr); nc <- terra::ncol(pr)
+  xs <- terra::xFromCol(pr, seq_len(nc))
+
+  kx <- 111320; ky <- 110574
+  E_proj <- cbind(edge_lonlat[, 1] * kx, edge_lonlat[, 2] * ky)
+  storage.mode(E_proj) <- "double"
+  n_edge_ref <- nrow(E_proj)
+  nn <- nn_index_builder(E_proj, backend = .nn_backend_selected)
+  rm(E_proj); gc()
+  msg("[peat-edge] computing distance using a ", nn$backend,
+      " k-d tree over ", n_edge_ref, " boundary points, k = ", k)
+
+  ncell_t <- terra::ncell(tmpl); ngc_t <- terra::ncol(tmpl)
+  sum_acc <- numeric(ncell_t); cnt_acc <- numeric(ncell_t)
+  tcol_all <- terra::colFromX(tmpl, xs)
+
+  w <- NULL
+  if (!is.null(out100)) {
+    w <- terra::rast(pr)
+    terra::writeStart(w, out100, overwrite = TRUE,
+                      datatype = "FLT4S", gdal = c("COMPRESS=LZW", "TILED=YES"))
+  }
+
+  rr <- 1L; done <- 0L
+  while (rr <= nr) {
+    nsub <- min(rows_per, nr - rr + 1L)
+    lat_b <- terra::yFromRow(pr, rr:(rr + nsub - 1L))
+    qlon <- rep(xs, times = nsub)
+    qlat <- rep(lat_b, each = nc)
+
+    idx <- nn$query(cbind(qlon * kx, qlat * ky), k)
+    dmin <- rep(Inf, length(qlon))
+    for (j in seq_len(ncol(idx))) {
+      ej <- edge_lonlat[idx[, j], , drop = FALSE]
+      dj <- terra::distance(cbind(qlon, qlat), ej, lonlat = TRUE, pairwise = TRUE)
+      dmin <- pmin(dmin, dj)
+      rm(ej, dj)
+    }
+    rm(idx)
+    d_km <- dmin / 1000
+    rm(dmin)
+
+    if (!is.null(w)) terra::writeValues(w, d_km, rr, nsub)
+
+    trow <- rep(terra::rowFromY(tmpl, lat_b), each = nc)
+    tcol <- rep(tcol_all, times = nsub)
+    key  <- (trow - 1L) * ngc_t + tcol
+    ok <- !is.na(key) & key >= 1L & key <= ncell_t & is.finite(d_km)
+    if (any(ok)) {
+      ag <- rowsum(cbind(d_km[ok], 1), key[ok], reorder = FALSE)
+      ki <- as.integer(rownames(ag))
+      sum_acc[ki] <- sum_acc[ki] + ag[, 1]
+      cnt_acc[ki] <- cnt_acc[ki] + ag[, 2]
+      rm(ag, ki)
+    }
+    rm(qlon, qlat, d_km, trow, tcol, key, ok)
+
+    rr <- rr + nsub; done <- done + 1L
+    if (done %% 5L == 0L) msg("[peat-edge] distance pass: row ", rr - 1L, " of ", nr)
+  }
+  if (!is.null(w)) terra::writeStop(w)
+  rm(nn); gc()
+
+  msg("[peat-edge] transferring distance to the analysis grid")
+  vals <- ifelse(cnt_acc > 0, sum_acc / cnt_acc, NA_real_)
+  out <- terra::rast(tmpl)
+  terra::values(out) <- vals
+  names(out) <- "d_peat_edge_km"
+  rm(sum_acc, cnt_acc, vals); gc()
+  out
+}
+```
+
+# Cell covariates
+
+Distance rasters are the slowest small-raster step in the workflow, so each is
+computed once and cached in `data/processed/`.
+
+```{r covariates}
+template_na <- terra::setValues(template, NA_real_)
+
+dist_km_cached <- function(vec_sf, name) {
+  path <- file.path(cfg$proc_dir, paste0(name, ".tif"))
+  discard_if_invalid(path, label = paste0(name, ".tif"))
+
+  have <- read_method(path)
+  want <- current_method_string()
+  method_matches <- identical(have, want)
+  if (file.exists(path) && !method_matches) {
+    msg("[distance] ", name, " was built with ",
+        ifelse(is.na(have), "an earlier version of this script", have),
+        " but cfg asks for ", want, ". Rebuilding for consistency.")
+  }
+
+  if (method_matches &&
+      cached_ok(path, ref = template, nlyr = 1, label = paste0(name, ".tif"))) {
+    r <- terra::rast(path); names(r) <- name; return(r)
+  }
+  if (is.null(vec_sf) || nrow(vec_sf) == 0) {
+    msg("no features for ", name, "; covariate set to NA")
+    r <- template_na; names(r) <- name
+    terra::writeRaster(r, path, overwrite = TRUE,
+                       datatype = "FLT4S", gdal = c("COMPRESS=LZW"))
+    write_method(path, cfg$distance_method)
+    return(terra::rast(path))
+  }
+  r <- build_distance_raster(template, vec_sf, path, name)
+  sweep_temp()
+  names(r) <- name
+  r
+}
+
+d_road_km   <- dist_km_cached(roads_all,   "d_road_km")
+d_mroad_km  <- dist_km_cached(roads_major, "d_mroad_km")
+d_river_km  <- dist_km_cached(rivers,      "d_river_km")
+d_settle_km <- dist_km_cached(places_pop,  "d_settle_km")
+
+# ---------------------------------------------------------------------------
+# Distance to the edge of the peat swamp forest.
+#
+# The full-domain terra::distance() that V6 used here is gone. It is not a
+# chunked operation and it aborted the R session on this machine. Nothing in
+# V7 attempts it, not even as a first try before a fallback.
+# ---------------------------------------------------------------------------
+
+edge_path  <- file.path(cfg$proc_dir, "d_peat_edge_km.tif")
+edge_path100 <- file.path(cfg$proc_dir, "d_peat_edge_km_100m.tif")
+
+# Remove anything left behind by the aborted V6 session. These names are no
+# longer produced by the workflow, and a truncated file must never be reused.
+for (stale_f in c(scratch("peat_bin100.tif"), scratch("peat_edge100.tif"),
+                  scratch("peat_edge_dist.tif"))) {
+  if (file.exists(stale_f)) {
+    msg("[peat-edge] removing obsolete scratch file: ", stale_f)
+    unlink(stale_f); unlink(paste0(stale_f, ".aux.xml"))
+  }
+}
+discard_if_invalid(edge_path, min_bytes = 2048, label = "d_peat_edge_km.tif")
+
+if (cached_ok(edge_path, ref = template, nlyr = 1, min_bytes = 2048,
+              label = "d_peat_edge_km.tif")) {
+  msg("[peat-edge] validating final cached raster")
+  msg("[peat-edge] cached product accepted, stage skipped")
+} else {
+  msg("[peat-edge] validating peat raster")
+  if (!validate_geotiff(peat100_path)) {
+    stop("[peat-edge] the 100 m peat classification at ", peat100_path,
+         " could not be read. Delete it and rerun the peat-on-hansen chunk.")
+  }
+  pr_edge <- terra::rast(peat100_path)
+  msg("[peat-edge] peat raster: ", terra::nrow(pr_edge), " x ",
+      terra::ncol(pr_edge), " cells at ", signif(terra::xres(pr_edge), 3), " deg")
+
+  msg("[peat-edge] creating binary peat mask and boundary by streaming")
+  edge_xy <- peat_edge_points(pr_edge, .pclass,
+                              rows_per = max(50L, cfg$block_rows_target * 2L))
+  if (!nrow(edge_xy)) {
+    stop("[peat-edge] no peat swamp forest boundary cells were found in ",
+         peat100_path, ". Check that class ", .pclass,
+         " is present in the CongoPeat classification.")
+  }
+  msg("[peat-edge] boundary cells found: ", nrow(edge_xy))
+
+  d_edge_grid <- peat_edge_distance(
+    pr_edge, template, edge_xy,
+    out100 = if (isTRUE(cfg$write_peat_edge_100m)) edge_path100 else NULL,
+    rows_per = max(50L, cfg$block_rows_target * 2L),
+    k = 2L
+  )
+
+  terra::writeRaster(d_edge_grid, edge_path, overwrite = TRUE,
+                     datatype = "FLT4S", gdal = c("COMPRESS=LZW"))
+  rm(d_edge_grid, edge_xy, pr_edge); sweep_temp()
+
+  msg("[peat-edge] validating final cached raster")
+  if (!cached_ok(edge_path, ref = template, nlyr = 1, min_bytes = 2048,
+                 label = "d_peat_edge_km.tif")) {
+    stop("[peat-edge] the raster just written to ", edge_path,
+         " failed validation. Delete it and rerun this chunk.")
+  }
+  msg("[peat-edge] completed successfully")
+}
+
+d_peat_edge_km <- terra::rast(edge_path)
+names(d_peat_edge_km) <- "d_peat_edge_km"
+msg("[peat-edge] range (km): ",
+    paste(round(as.vector(terra::minmax(d_peat_edge_km, compute = TRUE)[, 1]), 2),
+          collapse = " to "))
+
+# Protected-area fraction on the analysis grid.
+pa_path <- file.path(cfg$proc_dir, "pa_fraction.tif")
+if (!cached_ok(pa_path, ref = template, nlyr = 1, label = "pa_fraction.tif")) {
+  msg("rasterising protected areas onto the analysis grid")
+  if (nrow(pa) > 0) {
+    pf <- terra::rasterize(terra::vect(pa), template, cover = TRUE)
+    pf <- na0(pf)
+  } else {
+    pf <- terra::setValues(template, 0)
+  }
+  names(pf) <- "pa_frac"
+  terra::writeRaster(pf, pa_path, overwrite = TRUE,
+                     datatype = "FLT4S", gdal = c("COMPRESS=LZW"))
+  rm(pf); sweep_temp()
+}
+pa_frac <- terra::rast(pa_path); names(pa_frac) <- "pa_frac"
+
+# Optional concessions
+if (have_concessions) {
+  conc <- sf::st_read(manual_path, quiet = TRUE) |> sf::st_make_valid() |>
+    sf::st_transform(4326)
+  conc_frac <- na0(terra::rasterize(terra::vect(conc), template, cover = TRUE))
+  names(conc_frac) <- "conc_frac"
+  rm(conc); gc()
+} else {
+  conc_frac <- NULL
+}
+
+# Country and ADM1 label
+iso_num <- data.frame(iso3 = sort(unique(countries$iso3)),
+                      id = seq_along(unique(countries$iso3)))
+countries$id <- iso_num$id[match(countries$iso3, iso_num$iso3)]
+country_r <- terra::rasterize(terra::vect(countries), template, field = "id")
+names(country_r) <- "country_id"
+
+adm1$adm1_id <- seq_len(nrow(adm1))
+adm1_r <- terra::rasterize(terra::vect(adm1), template, field = "adm1_id")
+names(adm1_r) <- "adm1_id"
+
+cell_ha <- terra::cellSize(template, unit = "ha")
+names(cell_ha) <- "cell_ha"
+
+covars <- c(d_road_km, d_mroad_km, d_river_km, d_settle_km,
+            d_peat_edge_km, pa_frac, country_r, adm1_r, cell_ha)
+if (!is.null(conc_frac)) covars <- c(covars, conc_frac)
+
+print(names(covars))
+sweep_temp()
+```
+
+```{r rainfall-covariate}
+if (isTRUE(cfg$use_chirps)) {
+# Per-cell dry season = three consecutive months with the lowest climatological
+# mean, evaluated on the CHIRPS grid then moved to the analysis grid.
+rain_path <- file.path(cfg$proc_dir, "rain_covariates.tif")
+
+if (!cached_ok(rain_path, ref = template, label = "rain_covariates.tif")) {
+  msg("building the dry-season rainfall covariates")
+  nm  <- names(chirps)
+  yr  <- as.integer(substr(nm, 3, 6))
+  mo  <- as.integer(substr(nm, 8, 9))
+
+  clim <- terra::rast(lapply(1:12, function(m) {
+    idx <- which(mo == m)
+    terra::app(chirps[[idx]], fun = mean, na.rm = TRUE)
+  }))
+  names(clim) <- sprintf("clim_%02d", 1:12)
+
+  roll3 <- terra::rast(lapply(1:12, function(m) {
+    idx <- ((m - 1 + 0:2) %% 12) + 1
+    sum(clim[[idx]])
+  }))
+  names(roll3) <- sprintf("roll_%02d", 1:12)
+  dry_start <- terra::which.min(roll3)
+  names(dry_start) <- "dry_start_month"
+  rm(roll3)
+
+  uy <- sort(unique(yr))
+  dry_totals <- terra::rast(lapply(uy, function(y) {
+    acc <- terra::setValues(clim[[1]], 0)
+    for (m in 1:12) {
+      idx <- ((m - 1 + 0:2) %% 12) + 1
+      wanted <- which(yr == y & mo %in% idx)
+      if (!length(wanted)) next
+      tot <- sum(chirps[[wanted]])
+      acc <- terra::ifel(dry_start == m, tot, acc)
+    }
+    acc
+  }))
+  names(dry_totals) <- paste0("dry_", uy)
+
+  dry_mean <- terra::app(dry_totals, mean, na.rm = TRUE)
+  dry_sd   <- terra::app(dry_totals, sd,   na.rm = TRUE)
+  dry_z    <- (dry_totals - dry_mean) / dry_sd
+  names(dry_z) <- paste0("dryz_", uy)
+
+  rec_yrs <- cfg$recent_window[1]:cfg$recent_window[2]
+  have_rec <- paste0("dryz_", rec_yrs)
+  have_rec <- have_rec[have_rec %in% names(dry_z)]
+  dry_z_rec <- terra::app(dry_z[[have_rec]], mean, na.rm = TRUE)
+  names(dry_z_rec) <- "dry_z_recent"
+
+  rain_out <- c(
+    terra::resample(dry_mean,  template, method = "bilinear"),
+    terra::resample(dry_z_rec, template, method = "bilinear"),
+    terra::resample(dry_z,     template, method = "bilinear")
+  )
+  names(rain_out) <- c("dry_mean_mm", "dry_z_recent", names(dry_z))
+  terra::writeRaster(rain_out, rain_path, overwrite = TRUE,
+                     datatype = "FLT4S", gdal = c("COMPRESS=LZW", "TILED=YES"))
+  rm(clim, dry_totals, dry_z, dry_mean, dry_sd, dry_z_rec, dry_start, rain_out)
+  sweep_temp()
+}
+rain_cov <- terra::rast(rain_path)
+msg("Rainfall covariate layers: ", terra::nlyr(rain_cov))
+} else {
+  rain_cov <- NULL
+  msg("Rainfall covariates skipped because CHIRPS is disabled.")
+}
+```
+
+# Assembling the analytical dataset
+
+```{r assemble}
+stack_all <- c(grid_counts, covars)
+if (isTRUE(cfg$use_chirps) && exists("rain_cov")) {
+  stack_all <- c(stack_all, rain_cov[[c("dry_mean_mm", "dry_z_recent")]])
+}
+
+dat <- terra::as.data.frame(stack_all, xy = TRUE, cells = TRUE, na.rm = FALSE)
+dat <- tibble::as_tibble(dat)
+rm(stack_all); gc()
+
+dat <- dat |>
+  dplyr::mutate(
+    pix_ha        = cell_ha / npix,
+    forest_ha     = n_forest * pix_ha,
+    peat_ha       = n_peat * pix_ha,
+    peat_forest_ha= n_peat_forest * pix_ha,
+    peat_frac     = ifelse(n_forest > 0, n_peat_forest / n_forest, NA_real_),
+    loss_ha_rec   = n_loss_rec * pix_ha,
+    fire_ha_rec   = n_fire_rec * pix_ha,
+    nonfire_ha_rec= n_nonfire_rec * pix_ha,
+    loss_ha_base  = n_loss_base * pix_ha,
+    fire_ha_base  = n_fire_base * pix_ha,
+    fire_share_rec  = ifelse(n_loss_rec  > 0, n_fire_rec  / n_loss_rec,  NA_real_),
+    fire_share_base = ifelse(n_loss_base > 0, n_fire_base / n_loss_base, NA_real_),
+    iso3 = iso_num$iso3[match(country_id, iso_num$id)],
+    adm1_name = adm1$adm1_name[match(adm1_id, adm1$adm1_id)],
+    protected = pa_frac >= 0.5
+  )
+
+n_start <- nrow(dat)
+dat_model <- dat |>
+  dplyr::filter(
+    !is.na(n_forest),
+    n_forest >= 0.10 * npix,
+    !is.na(iso3),
+    !is.na(d_road_km), !is.na(d_river_km), !is.na(d_settle_km),
+    !is.na(d_peat_edge_km), !is.na(pa_frac)
+  )
+if (isTRUE(cfg$use_chirps)) {
+  dat_model <- dplyr::filter(dat_model, !is.na(dry_z_recent))
+}
+
+msg("Cells before filtering: ", n_start, "; after: ", nrow(dat_model))
+
+incl <- tibble::tibble(
+  step = c("all grid cells in domain",
+           "with baseline forest >= 10 % of cell",
+           "with country assigned",
+           "with all covariates non-missing"),
+  n = c(n_start,
+        sum(!is.na(dat$n_forest) & dat$n_forest >= 0.10 * npix, na.rm = TRUE),
+        sum(!is.na(dat$n_forest) & dat$n_forest >= 0.10 * npix & !is.na(dat$iso3), na.rm = TRUE),
+        nrow(dat_model))
+)
+write_table(incl, file.path(cfg$tab_dir, "table_S1_inclusion_flow.csv"))
+print(incl)
+
+write_table(dat,       file.path(cfg$tab_dir, "analysis_grid_full.csv"))
+write_table(dat_model, file.path(cfg$tab_dir, "analysis_grid_model.csv"))
+
+# dat is not used again; dat_model carries everything downstream.
+rm(dat); gc()
+```
+
+```{r assemble-panel}
+ann_df <- terra::as.data.frame(annual_counts, cells = TRUE, na.rm = FALSE)
+if (!"cell" %in% names(ann_df)) ann_df$cell <- seq_len(nrow(ann_df))
+ann_df$cell <- as.integer(ann_df$cell)
+
+# Keep only cells that survive the inclusion criteria before reshaping, which
+# cuts the long panel roughly in half before it is ever built.
+ann_df <- ann_df[ann_df$cell %in% dat_model$cell, , drop = FALSE]
+
+panel <- ann_df |>
+  tibble::as_tibble() |>
+  tidyr::pivot_longer(
+    cols = -cell,
+    names_to = c("metric", "year"),
+    names_pattern = "^(loss|fire|losspeat|firepeat)_(\\d{4})$",
+    values_to = "n"
+  ) |>
+  dplyr::mutate(year = as.integer(year)) |>
+  tidyr::pivot_wider(names_from = metric, values_from = n) |>
+  dplyr::rename(n_loss = loss, n_fire = fire,
+                n_loss_peat = losspeat, n_fire_peat = firepeat) |>
+  dplyr::mutate(n_nonfire = pmax(n_loss - n_fire, 0))
+rm(ann_df); gc()
+
+cell_static <- dat_model |>
+  dplyr::select(cell, x, y, iso3, adm1_name, pix_ha, forest_ha, peat_frac,
+                d_road_km, d_mroad_km, d_river_km, d_settle_km,
+                d_peat_edge_km, pa_frac, protected,
+                dplyr::any_of(c("conc_frac", "dry_mean_mm")))
+
+panel <- dplyr::inner_join(panel, cell_static, by = "cell")
+rm(cell_static); gc()
+
+if (isTRUE(cfg$use_chirps) && exists("rain_cov")) {
+  dz <- terra::as.data.frame(rain_cov[[grep("^dryz_", names(rain_cov))]],
+                             cells = TRUE, na.rm = FALSE)
+  if (!"cell" %in% names(dz)) dz$cell <- seq_len(nrow(dz))
+  dz$cell <- as.integer(dz$cell)
+  dz <- dz[dz$cell %in% panel$cell, , drop = FALSE]
+  dz <- tibble::as_tibble(dz) |>
+    tidyr::pivot_longer(-cell, names_to = "year", values_to = "dry_z",
+                        names_prefix = "dryz_") |>
+    dplyr::mutate(year = as.integer(year))
+  panel <- dplyr::left_join(panel, dz, by = c("cell", "year"))
+  rm(dz); gc()
+}
+
+panel <- panel |>
+  dplyr::mutate(
+    loss_ha    = n_loss * pix_ha,
+    fire_ha    = n_fire * pix_ha,
+    nonfire_ha = n_nonfire * pix_ha,
+    fire_ha_peat = n_fire_peat * pix_ha,
+    loss_ha_peat = n_loss_peat * pix_ha
+  ) |>
+  dplyr::filter(forest_ha > 0)
+
+msg("Panel rows: ", nrow(panel), " (", dplyr::n_distinct(panel$cell), " cells x ",
+    dplyr::n_distinct(panel$year), " years)")
+write_table(panel, file.path(cfg$tab_dir, "analysis_panel_cell_year.csv"))
+gc()
+```
+
+# Descriptive results
+
+```{r descriptives-annual}
+annual_summary <- panel |>
+  dplyr::group_by(year) |>
+  dplyr::summarise(
+    loss_ha         = sum(loss_ha, na.rm = TRUE),
+    fire_ha         = sum(fire_ha, na.rm = TRUE),
+    nonfire_ha      = sum(nonfire_ha, na.rm = TRUE),
+    loss_ha_peat    = sum(loss_ha_peat, na.rm = TRUE),
+    fire_ha_peat    = sum(fire_ha_peat, na.rm = TRUE),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    nonfire_ha_peat = pmax(loss_ha_peat - fire_ha_peat, 0),
+    fire_share      = ifelse(loss_ha > 0, fire_ha / loss_ha, NA_real_),
+    fire_share_peat = ifelse(loss_ha_peat > 0, fire_ha_peat / loss_ha_peat, NA_real_)
+  )
+
+# Precomputed here so that the large panel can be released before the models.
+if (isTRUE(cfg$use_chirps) && "dry_z" %in% names(panel)) {
+  rain_year <- panel |>
+    dplyr::group_by(year) |>
+    dplyr::summarise(fire_ha = sum(fire_ha),
+                     dry_z = mean(dry_z, na.rm = TRUE), .groups = "drop") |>
+    dplyr::filter(!is.na(dry_z))
+} else {
+  rain_year <- NULL
+}
+
+write_table(annual_summary, file.path(cfg$tab_dir, "table_1_annual_loss_by_driver.csv"))
+knitr::kable(annual_summary, digits = 3)
+```
+
+```{r descriptives-country}
+annual_country <- panel |>
+  dplyr::group_by(iso3, year) |>
+  dplyr::summarise(loss_ha = sum(loss_ha), fire_ha = sum(fire_ha),
+                   loss_ha_peat = sum(loss_ha_peat), fire_ha_peat = sum(fire_ha_peat),
+                   .groups = "drop") |>
+  dplyr::mutate(fire_share = ifelse(loss_ha > 0, fire_ha / loss_ha, NA_real_))
+write_table(annual_country, file.path(cfg$tab_dir, "table_S2_annual_by_country.csv"))
+
+annual_adm1 <- panel |>
+  dplyr::group_by(iso3, adm1_name, year) |>
+  dplyr::summarise(loss_ha = sum(loss_ha), fire_ha = sum(fire_ha),
+                   fire_ha_peat = sum(fire_ha_peat), .groups = "drop")
+write_table(annual_adm1, file.path(cfg$tab_dir, "table_S3_annual_by_adm1.csv"))
+
+window_summary <- panel |>
+  dplyr::mutate(window = dplyr::case_when(
+    year >= cfg$base_window[1]   & year <= cfg$base_window[2]   ~ "2001-2022",
+    year >= cfg$recent_window[1] & year <= cfg$recent_window[2] ~ "2023-2025",
+    TRUE ~ NA_character_)) |>
+  dplyr::filter(!is.na(window)) |>
+  dplyr::group_by(window, iso3) |>
+  dplyr::summarise(
+    n_years = dplyr::n_distinct(year),
+    loss_ha_per_yr      = sum(loss_ha) / dplyr::n_distinct(year),
+    fire_ha_per_yr      = sum(fire_ha) / dplyr::n_distinct(year),
+    fire_ha_peat_per_yr = sum(fire_ha_peat) / dplyr::n_distinct(year),
+    fire_share          = sum(fire_ha) / sum(loss_ha),
+    fire_share_peat     = sum(fire_ha_peat) / pmax(sum(loss_ha_peat), 1e-9),
+    .groups = "drop"
+  )
+write_table(window_summary, file.path(cfg$tab_dir, "table_2_window_contrast.csv"))
+knitr::kable(window_summary, digits = 3)
+rm(annual_country, annual_adm1); gc()
+```
+
+```{r descriptives-pa}
+pa_summary <- panel |>
+  dplyr::mutate(window = dplyr::case_when(
+    year <= cfg$base_window[2] ~ "2001-2022",
+    TRUE ~ "2023-2025")) |>
+  dplyr::group_by(window, protected) |>
+  dplyr::summarise(
+    forest_ha = sum(forest_ha[year == min(year)]),
+    fire_ha_per_yr    = sum(fire_ha) / dplyr::n_distinct(year),
+    nonfire_ha_per_yr = sum(nonfire_ha) / dplyr::n_distinct(year),
+    .groups = "drop"
+  ) |>
+  dplyr::mutate(
+    fire_rate_pct    = 100 * fire_ha_per_yr / forest_ha,
+    nonfire_rate_pct = 100 * nonfire_ha_per_yr / forest_ha
+  )
+write_table(pa_summary, file.path(cfg$tab_dir, "table_3_protected_area_rates.csv"))
+knitr::kable(pa_summary, digits = 4)
+```
+
+```{r descriptives-covariates}
+covariate_summary <- dat_model |>
+  dplyr::select(forest_ha, peat_frac, d_road_km, d_mroad_km, d_river_km,
+                d_settle_km, d_peat_edge_km, pa_frac,
+                dplyr::any_of(c("dry_z_recent", "dry_mean_mm", "conc_frac"))) |>
+  tidyr::pivot_longer(dplyr::everything(), names_to = "variable", values_to = "value") |>
+  dplyr::group_by(variable) |>
+  dplyr::summarise(
+    n = sum(!is.na(value)),
+    mean = mean(value, na.rm = TRUE),
+    sd = sd(value, na.rm = TRUE),
+    p10 = quantile(value, 0.10, na.rm = TRUE),
+    median = median(value, na.rm = TRUE),
+    p90 = quantile(value, 0.90, na.rm = TRUE),
+    .groups = "drop"
+  )
+write_table(covariate_summary, file.path(cfg$tab_dir, "table_S4_covariate_summary.csv"))
+knitr::kable(covariate_summary, digits = 3)
+```
+
+# Primary models
+
+```{r model-prep}
+mdat <- dat_model |>
+  dplyr::mutate(
+    log_forest = log(pmax(forest_ha, 1e-6)),
+    l_road   = log1p(d_road_km),
+    l_mroad  = log1p(d_mroad_km),
+    l_river  = log1p(d_river_km),
+    l_settle = log1p(d_settle_km),
+    l_edge   = log1p(d_peat_edge_km),
+    iso3 = factor(iso3)
+  )
+
+rhs <- c("peat_frac", "l_road", "l_river", "l_settle", "l_edge", "pa_frac")
+if (nlevels(mdat$iso3) > 1) rhs <- c(rhs, "iso3")
+if (isTRUE(cfg$use_chirps)) rhs <- c(rhs, "dry_z_recent")
+if (have_concessions) rhs <- c(rhs, "conc_frac")
+
+form_fire    <- as.formula(paste("n_fire_rec ~",    paste(rhs, collapse = " + "),
+                                 "+ offset(log_forest)"))
+form_nonfire <- as.formula(paste("n_nonfire_rec ~", paste(rhs, collapse = " + "),
+                                 "+ offset(log_forest)"))
+print(form_fire)
+```
+
+```{r model-primary}
+m_fire <- MASS::glm.nb(form_fire, data = mdat, control = glm.control(maxit = 200))
+summary(m_fire)
+
+m_nonfire <- MASS::glm.nb(form_nonfire, data = mdat, control = glm.control(maxit = 200))
+summary(m_nonfire)
+
+tidy_nb <- function(m, label) {
+  co <- summary(m)$coefficients
+  tibble::tibble(
+    model = label, term = rownames(co),
+    estimate = co[, 1], se = co[, 2], z = co[, 3], p = co[, 4]
+  ) |>
+    dplyr::mutate(
+      rate_ratio = exp(estimate),
+      rr_lo = exp(estimate - 1.96 * se),
+      rr_hi = exp(estimate + 1.96 * se)
+    )
+}
+
+tab_primary <- dplyr::bind_rows(
+  tidy_nb(m_fire, "fire-driven loss 2023-2025"),
+  tidy_nb(m_nonfire, "non-fire loss 2023-2025")
+)
+write_table(tab_primary, file.path(cfg$tab_dir, "table_4_primary_models.csv"))
+knitr::kable(tab_primary, digits = 4)
+```
+
+```{r model-panel}
+# Keep only the columns the panel models need. On an 8 GB machine the model
+# frame for a 600 thousand row negative binomial is one of the larger objects
+# in the session, so it is built from a minimal data frame.
+panel_cols <- c("cell", "year", "n_fire", "forest_ha", "peat_frac",
+                "d_road_km", "d_river_km", "d_settle_km", "d_peat_edge_km",
+                "pa_frac", "iso3")
+if ("dry_z" %in% names(panel)) panel_cols <- c(panel_cols, "dry_z")
+
+pdat <- panel[, panel_cols] |>
+  dplyr::mutate(
+    log_forest = log(pmax(forest_ha, 1e-6)),
+    l_road = log1p(d_road_km), l_river = log1p(d_river_km),
+    l_settle = log1p(d_settle_km), l_edge = log1p(d_peat_edge_km),
+    year_f = factor(year),
+    iso3 = factor(iso3)
+  ) |>
+  dplyr::select(-d_road_km, -d_river_km, -d_settle_km, -d_peat_edge_km, -forest_ha)
+
+# The full panel is no longer needed: annual_summary, window_summary,
+# pa_summary and rain_year were all computed above.
+rm(panel); gc()
+
+prhs <- c("peat_frac", "l_road", "l_river", "l_settle", "l_edge", "pa_frac", "year_f")
+if (nlevels(pdat$iso3) > 1) prhs <- c(prhs, "iso3")
+if (isTRUE(cfg$use_chirps) && "dry_z" %in% names(pdat)) prhs <- c(prhs, "dry_z")
+
+form_panel <- as.formula(paste("n_fire ~", paste(prhs, collapse = " + "),
+                               "+ offset(log_forest)"))
+
+msg("fitting the panel negative binomial on ", nrow(pdat), " rows")
+m_panel <- MASS::glm.nb(form_panel, data = pdat, control = glm.control(maxit = 100))
+
+vc <- sandwich::vcovCL(m_panel, cluster = pdat$cell, type = "HC0")
+ct <- lmtest::coeftest(m_panel, vcov. = vc)
+
+tab_panel <- tibble::tibble(
+  model = "panel NB, fire-driven loss 2001-2025, cluster-robust by cell",
+  term = rownames(ct),
+  estimate = ct[, 1], se = ct[, 2], z = ct[, 3], p = ct[, 4]
+) |>
+  dplyr::mutate(rate_ratio = exp(estimate),
+                rr_lo = exp(estimate - 1.96 * se),
+                rr_hi = exp(estimate + 1.96 * se))
+
+write_table(tab_panel, file.path(cfg$tab_dir, "table_5_panel_model.csv"))
+knitr::kable(head(tab_panel, 25), digits = 4)
+rm(vc, ct); gc()
+```
+
+```{r model-interaction}
+pdat$anom <- factor(ifelse(pdat$year >= cfg$recent_window[1], "2023-2025", "2001-2022"),
+                    levels = c("2001-2022", "2023-2025"))
+form_int <- as.formula(paste("n_fire ~ peat_frac * anom +",
+                             paste(setdiff(prhs, c("year_f", "peat_frac")), collapse = " + "),
+                             "+ offset(log_forest)"))
+m_int <- MASS::glm.nb(form_int, data = pdat, control = glm.control(maxit = 100))
+vc_i <- sandwich::vcovCL(m_int, cluster = pdat$cell, type = "HC0")
+ct_i <- lmtest::coeftest(m_int, vcov. = vc_i)
+
+tab_int <- tibble::tibble(
+  model = "peat x period interaction",
+  term = rownames(ct_i), estimate = ct_i[, 1], se = ct_i[, 2],
+  z = ct_i[, 3], p = ct_i[, 4]
+) |>
+  dplyr::mutate(rate_ratio = exp(estimate))
+write_table(tab_int, file.path(cfg$tab_dir, "table_6_peat_period_interaction.csv"))
+knitr::kable(tab_int, digits = 4)
+
+# The two panel models are large. Keep only what the diagnostics chunk needs.
+panel_diag <- list(n = nobs(m_panel), theta = m_panel$theta, aic = AIC(m_panel),
+                   dev_ratio = deviance(m_panel) / df.residual(m_panel))
+rm(m_int, vc_i, ct_i, m_panel, pdat); gc()
+```
+
+# Robustness and sensitivity
+
+```{r robust-poisson}
+m_pois <- glm(form_fire, data = mdat, family = poisson())
+vc_p <- sandwich::vcovHC(m_pois, type = "HC0")
+ct_p <- lmtest::coeftest(m_pois, vcov. = vc_p)
+tab_pois <- tibble::tibble(model = "Poisson, robust SE", term = rownames(ct_p),
+                           estimate = ct_p[, 1], se = ct_p[, 2], p = ct_p[, 4]) |>
+  dplyr::mutate(rate_ratio = exp(estimate))
+write_table(tab_pois, file.path(cfg$tab_dir, "table_S5_poisson_robust.csv"))
+
+disp <- sum(residuals(m_pois, type = "pearson")^2) / df.residual(m_pois)
+msg("Poisson dispersion statistic: ", round(disp, 2),
+    " (values well above 1 justify the negative binomial)")
+rm(m_pois, vc_p, ct_p); gc()
+```
+
+```{r robust-binomial}
+bdat <- mdat |> dplyr::filter(n_loss_rec > 0)
+form_bin <- as.formula(paste("cbind(n_fire_rec, n_loss_rec - n_fire_rec) ~",
+                             paste(rhs, collapse = " + ")))
+m_bin <- glm(form_bin, data = bdat, family = quasibinomial())
+co_bin <- summary(m_bin)$coefficients
+tab_bin <- tibble::tibble(model = "quasi-binomial fire share of loss",
+                          term = rownames(co_bin),
+                          estimate = co_bin[, 1], se = co_bin[, 2], p = co_bin[, 4]) |>
+  dplyr::mutate(odds_ratio = exp(estimate))
+write_table(tab_bin, file.path(cfg$tab_dir, "table_S6_fire_share_quasibinomial.csv"))
+knitr::kable(tab_bin, digits = 4)
+rm(bdat, m_bin, co_bin); gc()
+```
+
+```{r robust-grid-size}
+# Refit the primary specification on coarser and finer grids. Each grid size
+# is one streaming pass, and the distance rasters at each resolution are
+# cached so a rerun does not repeat them.
+refit_at_grid <- function(gdeg) {
+  f <- as.integer(round(gdeg / terra::res(lossyear)[1]))
+  msg("grid-size sensitivity: ", gdeg, " degrees (factor ", f, ")")
+
+  cs <- if (block_engine_ok) count_blockwise(f, label = paste0("counts at ", gdeg)) else
+    count_terra_fallback(f)
+
+  tmpl_f  <- mat_to_grid(cs$n_forest, f)
+  tn_f    <- terra::setValues(tmpl_f, NA_real_)
+
+  dist_at <- function(vec_sf, nm) {
+    path <- file.path(cfg$proc_dir, sprintf("%s_grid%s.tif", nm,
+                                            gsub("\\.", "p", format(gdeg))))
+    discard_if_invalid(path, label = basename(path))
+    if (identical(read_method(path), current_method_string()) &&
+        cached_ok(path, ref = tmpl_f, nlyr = 1, label = basename(path))) {
+      return(terra::rast(path))
+    }
+    # Same routine as the main grid, so the sensitivity analysis and the
+    # primary analysis use one definition of distance.
+    build_distance_raster(tmpl_f, vec_sf, path,
+                          sprintf("%s at %s deg", nm, gdeg))
+  }
+
+  road_r  <- dist_at(roads_all,  "d_road_km")
+  river_r <- dist_at(rivers,     "d_river_km")
+  set_r   <- dist_at(places_pop, "d_settle_km")
+  area_r  <- terra::cellSize(tmpl_f, unit = "ha")
+
+  d <- tibble::tibble(
+    n_forest      = as.vector(t(cs$n_forest)),
+    n_peat_forest = as.vector(t(cs$n_peat_forest)),
+    n_fire        = as.vector(t(cs$n_fire_rec)),
+    cell_ha       = as.vector(terra::values(area_r)),
+    d_road_km     = as.vector(terra::values(road_r)),
+    d_river_km    = as.vector(terra::values(river_r)),
+    d_settle_km   = as.vector(terra::values(set_r))
+  )
+  rm(cs, tmpl_f, tn_f, road_r, river_r, set_r, area_r); sweep_temp()
+
+  d$pix_ha    <- d$cell_ha / (f^2)
+  d$forest_ha <- d$n_forest * d$pix_ha
+  d$peat_frac <- ifelse(d$n_forest > 0, d$n_peat_forest / d$n_forest, NA_real_)
+  d <- d |>
+    dplyr::filter(!is.na(n_forest), n_forest >= 0.10 * f^2,
+                  !is.na(d_road_km), !is.na(d_river_km), !is.na(d_settle_km)) |>
+    dplyr::mutate(log_forest = log(pmax(forest_ha, 1e-6)),
+                  l_road = log1p(d_road_km), l_river = log1p(d_river_km),
+                  l_settle = log1p(d_settle_km))
+  m <- MASS::glm.nb(n_fire ~ peat_frac + l_road + l_river + l_settle + offset(log_forest),
+                    data = d, control = glm.control(maxit = 200))
+  co <- summary(m)$coefficients
+  out <- tibble::tibble(grid_deg = gdeg, n_cells = nrow(d), term = rownames(co),
+                        estimate = co[, 1], se = co[, 2], p = co[, 4]) |>
+    dplyr::mutate(rate_ratio = exp(estimate))
+  rm(d, m); gc()
+  out
+}
+
+grid_sens <- dplyr::bind_rows(lapply(cfg$grid_deg_sens, function(g) {
+  out <- try(refit_at_grid(g), silent = TRUE)
+  if (inherits(out, "try-error")) {
+    msg("grid-size sensitivity failed at ", g, " degrees: ",
+        attr(out, "condition")$message)
+    NULL
+  } else out
+}))
+write_table(grid_sens, file.path(cfg$tab_dir, "table_S7_grid_size_sensitivity.csv"))
+knitr::kable(grid_sens, digits = 4)
+sweep_temp()
+```
+
+```{r robust-canopy-threshold}
+if (isTRUE(have_treecover)) {
+# One streaming pass covers all three canopy thresholds. Areas use exact
+# per-row geodesic pixel areas, so they match a cellSize based calculation.
+canopy_threshold_areas <- function(thresholds) {
+  nr <- terra::nrow(lossyear); nc <- terra::ncol(lossyear)
+  strip <- terra::rast(nrows = nr, ncols = 1,
+                       xmin = terra::xmin(lossyear),
+                       xmax = terra::xmin(lossyear) + terra::xres(lossyear),
+                       ymin = terra::ymin(lossyear), ymax = terra::ymax(lossyear),
+                       crs = terra::crs(lossyear))
+  row_ha <- as.vector(terra::values(terra::cellSize(strip, unit = "ha")))
+  rm(strip)
+
+  acc <- lapply(thresholds, function(th) c(forest = 0, peat_forest = 0,
+                                           loss = 0, fire = 0))
+  names(acc) <- as.character(thresholds)
+
+  terra::readStart(treecover); terra::readStart(peat30)
+  terra::readStart(lossyear);  terra::readStart(fireyear)
+  on.exit({
+    try(terra::readStop(treecover), silent = TRUE)
+    try(terra::readStop(peat30), silent = TRUE)
+    try(terra::readStop(lossyear), silent = TRUE)
+    try(terra::readStop(fireyear), silent = TRUE)
+  }, add = TRUE)
+
+  rows_per <- max(1L, cfg$block_rows_target)
+  rr <- 1L
+  while (rr <= nr) {
+    nsub <- min(rows_per, nr - rr + 1L)
+    TC <- terra::readValues(treecover, row = rr, nrows = nsub, col = 1, ncols = nc)
+    PC <- terra::readValues(peat30,    row = rr, nrows = nsub, col = 1, ncols = nc)
+    Lv <- terra::readValues(lossyear,  row = rr, nrows = nsub, col = 1, ncols = nc)
+    Fv <- terra::readValues(fireyear,  row = rr, nrows = nsub, col = 1, ncols = nc)
+    TC[is.na(TC)] <- -1; PC[is.na(PC)] <- -1
+    Lv[is.na(Lv)] <- 0;  Fv[is.na(Fv)] <- 0
+    ha <- row_ha[rr:(rr + nsub - 1L)]
+    inL <- Lv >= y_lo_rec & Lv <= y_hi_rec
+    inF <- Fv >= y_lo_rec & Fv <= y_hi_rec
+    pe  <- PC == .pclass
+
+    for (th in thresholds) {
+      fo <- (TC >= th) & (PC %in% .fclasses)
+      rs <- function(v) colSums(matrix(as.numeric(v), nrow = nc))
+      k <- as.character(th)
+      acc[[k]]["forest"]      <- acc[[k]]["forest"]      + sum(rs(fo) * ha)
+      acc[[k]]["peat_forest"] <- acc[[k]]["peat_forest"] + sum(rs(fo & pe) * ha)
+      acc[[k]]["loss"]        <- acc[[k]]["loss"]        + sum(rs(fo & inL) * ha)
+      acc[[k]]["fire"]        <- acc[[k]]["fire"]        + sum(rs(fo & inF) * ha)
+    }
+    rm(TC, PC, Lv, Fv, inL, inF, pe)
+    if ((rr %/% rows_per) %% 50L == 0L) msg("canopy threshold pass: row ", rr, " of ", nr)
+    rr <- rr + nsub
+  }
+  acc
+}
+
+acc_th <- canopy_threshold_areas(cfg$forest_thresh_sens)
+thresh_sens <- dplyr::bind_rows(lapply(cfg$forest_thresh_sens, function(th) {
+  a <- acc_th[[as.character(th)]]
+  tibble::tibble(
+    canopy_threshold_pct = th,
+    forest_ha      = a[["forest"]],
+    peat_forest_ha = a[["peat_forest"]],
+    loss_ha_recent = a[["loss"]],
+    fire_ha_recent = a[["fire"]]
+  ) |>
+    dplyr::mutate(fire_share_recent = fire_ha_recent / loss_ha_recent,
+                  recent_loss_pct_of_forest = 100 * loss_ha_recent / forest_ha)
+}))
+write_table(thresh_sens, file.path(cfg$tab_dir, "table_S8_canopy_threshold_sensitivity.csv"))
+knitr::kable(thresh_sens, digits = 4)
+rm(acc_th); sweep_temp()
+} else {
+  msg("Canopy-threshold sensitivity skipped because Hansen treecover2000 is unavailable.")
+}
+```
+
+```{r robust-spatial-autocorrelation}
+set.seed(cfg$seed)
+res_df <- mdat |>
+  dplyr::mutate(resid = residuals(m_fire, type = "pearson")) |>
+  dplyr::select(x, y, resid)
+
+n_sub <- min(3000L, nrow(res_df))
+sub <- res_df[sample.int(nrow(res_df), n_sub), ]
+rm(res_df); gc()
+
+morans_I <- function(sub, cutoff_km = 25) {
+  xy <- as.matrix(sub[, c("x", "y")])
+  z  <- sub$resid - mean(sub$resid)
+  dm <- as.matrix(dist(xy)) * 111.32
+  W  <- ifelse(dm > 0 & dm <= cutoff_km, 1 / dm, 0)
+  rm(dm)
+  S0 <- sum(W)
+  n  <- length(z)
+  I  <- (n / S0) * (t(z) %*% W %*% z) / sum(z^2)
+  EI <- -1 / (n - 1)
+  perm <- replicate(199, {
+    zp <- sample(z)
+    as.numeric((n / S0) * (t(zp) %*% W %*% zp) / sum(zp^2))
+  })
+  out <- tibble::tibble(
+    cutoff_km = cutoff_km, n = n,
+    morans_I = as.numeric(I), expected_I = EI,
+    perm_mean = mean(perm), perm_sd = sd(perm),
+    p_perm = (1 + sum(abs(perm - EI) >= abs(as.numeric(I) - EI))) / 200
+  )
+  rm(W); gc()
+  out
+}
+
+moran_tab <- dplyr::bind_rows(lapply(c(15, 25, 50), function(k) morans_I(sub, k)))
+write_table(moran_tab, file.path(cfg$diag_dir, "table_S9_morans_I_residuals.csv"))
+knitr::kable(moran_tab, digits = 4)
+rm(sub); gc()
+```
+
+```{r robust-spatial-lag}
+lag_r <- terra::focal(grid_counts[["n_fire_rec"]], w = 3, fun = "mean", na.policy = "omit")
+names(lag_r) <- "fire_lag"
+lag_df <- terra::as.data.frame(lag_r, cells = TRUE, na.rm = FALSE)
+if (!"cell" %in% names(lag_df)) lag_df$cell <- seq_len(nrow(lag_df))
+lag_df$cell <- as.integer(lag_df$cell)
+mdat_lag <- dplyr::left_join(mdat, tibble::as_tibble(lag_df), by = "cell") |>
+  dplyr::mutate(l_lag = log1p(fire_lag)) |>
+  dplyr::filter(!is.na(l_lag))
+rm(lag_r, lag_df); gc()
+
+m_lag <- MASS::glm.nb(as.formula(paste("n_fire_rec ~", paste(c(rhs, "l_lag"), collapse = " + "),
+                                       "+ offset(log_forest)")),
+                      data = mdat_lag, control = glm.control(maxit = 200))
+tab_lag <- tidy_nb(m_lag, "primary model plus spatial lag")
+write_table(tab_lag, file.path(cfg$tab_dir, "table_S10_spatial_lag_model.csv"))
+knitr::kable(tab_lag, digits = 4)
+rm(m_lag, mdat_lag); gc()
+```
+
+```{r robust-placebo}
+form_placebo <- as.formula(paste("n_fire_base ~", paste(rhs, collapse = " + "),
+                                 "+ offset(log_forest)"))
+m_placebo <- MASS::glm.nb(form_placebo, data = mdat, control = glm.control(maxit = 200))
+tab_placebo <- tidy_nb(m_placebo, "fire-driven loss 2001-2022")
+write_table(tab_placebo, file.path(cfg$tab_dir, "table_S11_reference_window_model.csv"))
+knitr::kable(tab_placebo, digits = 4)
+rm(m_placebo); gc()
+```
+
+# Model diagnostics
+
+```{r diagnostics}
+diag_plot_data <- tibble::tibble(
+  fitted = fitted(m_fire),
+  pearson = residuals(m_fire, type = "pearson"),
+  deviance = residuals(m_fire, type = "deviance")
+)
+
+p_diag <- ggplot2::ggplot(diag_plot_data, ggplot2::aes(x = log1p(fitted), y = pearson)) +
+  ggplot2::geom_point(alpha = 0.2, size = 0.6) +
+  ggplot2::geom_hline(yintercept = 0, linewidth = 0.3) +
+  ggplot2::geom_smooth(method = "loess", se = FALSE, linewidth = 0.6, colour = "firebrick") +
+  ggplot2::labs(x = "log(1 + fitted count)", y = "Pearson residual",
+                title = "Primary model residuals") +
+  theme_paper
+save_plot_both(p_diag, "figS1_residuals_primary_model", cfg$diag_dir,
+               width = 6.5, height = 4.5)
+
+diag_tab <- tibble::tibble(
+  model = c("fire 2023-2025", "non-fire 2023-2025", "panel fire 2001-2025"),
+  n = c(nobs(m_fire), nobs(m_nonfire), panel_diag$n),
+  theta = c(m_fire$theta, m_nonfire$theta, panel_diag$theta),
+  aic = c(AIC(m_fire), AIC(m_nonfire), panel_diag$aic),
+  deviance_ratio = c(deviance(m_fire) / df.residual(m_fire),
+                     deviance(m_nonfire) / df.residual(m_nonfire),
+                     panel_diag$dev_ratio)
+)
+write_table(diag_tab, file.path(cfg$diag_dir, "model_diagnostics.csv"))
+knitr::kable(diag_tab, digits = 3)
+
+vif_manual <- function(model) {
+  X <- model.matrix(model)[, -1, drop = FALSE]
+  X <- X[, apply(X, 2, function(z) length(unique(z)) > 1), drop = FALSE]
+  out <- vapply(seq_len(ncol(X)), function(j) {
+    r2 <- summary(lm(X[, j] ~ X[, -j, drop = FALSE]))$r.squared
+    1 / (1 - r2)
+  }, numeric(1))
+  res <- tibble::tibble(term = colnames(X), vif = out)
+  rm(X); gc()
+  res
+}
+vif_tab <- vif_manual(m_fire)
+write_table(vif_tab, file.path(cfg$diag_dir, "variance_inflation_factors.csv"))
+knitr::kable(vif_tab, digits = 2)
+rm(diag_plot_data, m_nonfire); gc()
+```
+
+# Publication figures
+
+Every figure is written twice, as a 400 dpi PNG and as a vector PDF, directly
+into `outputs/figures/`.
+
+```{r fig1-timeseries}
+ts_long <- annual_summary |>
+  dplyr::select(year, fire_ha, nonfire_ha) |>
+  tidyr::pivot_longer(-year, names_to = "driver", values_to = "ha") |>
+  dplyr::mutate(driver = dplyr::recode(driver,
+                                       fire_ha = "Fire-driven loss",
+                                       nonfire_ha = "Other drivers"))
+
+p1 <- ggplot2::ggplot(ts_long, ggplot2::aes(year, ha / 1000, fill = driver)) +
+  ggplot2::geom_col(width = 0.75) +
+  ggplot2::scale_fill_manual(values = c("Fire-driven loss" = "#B2182B",
+                                        "Other drivers" = "#4393C3"), name = NULL) +
+  ggplot2::scale_x_continuous(breaks = seq(2001, cfg$year_max, 3)) +
+  ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.05))) +
+  ggplot2::labs(x = NULL, y = "Forest loss (thousand ha)",
+                title = "Annual forest loss in the central Congo Basin peatland complex") +
+  theme_paper
+save_fig(p1, "fig1_annual_loss_by_driver", width = 8, height = 4.5)
+p1
+```
+
+```{r fig2-fire-share}
+share_long <- annual_summary |>
+  dplyr::select(year, fire_share, fire_share_peat) |>
+  tidyr::pivot_longer(-year, names_to = "stratum", values_to = "share") |>
+  dplyr::mutate(stratum = dplyr::recode(stratum,
+                                        fire_share = "All forest",
+                                        fire_share_peat = "Peat swamp forest"))
+
+p2 <- ggplot2::ggplot(share_long, ggplot2::aes(year, 100 * share, colour = stratum)) +
+  ggplot2::geom_line(linewidth = 0.7) +
+  ggplot2::geom_point(size = 1.4) +
+  ggplot2::scale_colour_manual(values = c("All forest" = "grey35",
+                                          "Peat swamp forest" = "#B2182B"), name = NULL) +
+  ggplot2::scale_x_continuous(breaks = seq(2001, cfg$year_max, 3)) +
+  ggplot2::labs(x = NULL, y = "Fire-attributed share of loss (%)",
+                title = "Fire share of mapped forest loss") +
+  theme_paper
+save_fig(p2, "fig2_fire_share_of_loss", width = 8, height = 4.5)
+p2
+```
+
+```{r fig3-distance-gradient}
+grad <- mdat |>
+  dplyr::mutate(bin = cut(d_road_km, breaks = c(-0.001, 1, 2, 5, 10, 20, 50, Inf),
+                          labels = c("0-1", "1-2", "2-5", "5-10", "10-20", "20-50", ">50"))) |>
+  dplyr::group_by(bin) |>
+  dplyr::summarise(
+    forest_ha = sum(forest_ha),
+    fire_ha = sum(fire_ha_rec),
+    nonfire_ha = sum(nonfire_ha_rec),
+    .groups = "drop") |>
+  dplyr::mutate(fire_rate = 100 * fire_ha / forest_ha,
+                nonfire_rate = 100 * nonfire_ha / forest_ha) |>
+  tidyr::pivot_longer(c(fire_rate, nonfire_rate), names_to = "driver", values_to = "rate") |>
+  dplyr::mutate(driver = dplyr::recode(driver, fire_rate = "Fire-driven",
+                                       nonfire_rate = "Other drivers"))
+
+p3 <- ggplot2::ggplot(grad, ggplot2::aes(bin, rate, fill = driver)) +
+  ggplot2::geom_col(position = "dodge", width = 0.75) +
+  ggplot2::scale_fill_manual(values = c("Fire-driven" = "#B2182B",
+                                        "Other drivers" = "#4393C3"), name = NULL) +
+  ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0, 0.05))) +
+  ggplot2::labs(x = "Distance to nearest road (km)",
+                y = paste0("Loss ", cfg$recent_window[1], "-", cfg$recent_window[2],
+                           " (% of baseline forest)"),
+                title = "Access gradient in fire-driven and other loss") +
+  theme_paper
+save_fig(p3, "fig3_road_distance_gradient", width = 8, height = 4.5)
+p3
+```
+
+```{r fig4-coefficients}
+coef_plot_data <- tab_primary |>
+  dplyr::filter(term != "(Intercept)") |>
+  dplyr::mutate(term = factor(term, levels = rev(unique(term))))
+
+p4 <- ggplot2::ggplot(coef_plot_data,
+                      ggplot2::aes(rate_ratio, term, colour = model)) +
+  ggplot2::geom_vline(xintercept = 1, linetype = 2, linewidth = 0.3) +
+  ggplot2::geom_pointrange(ggplot2::aes(xmin = rr_lo, xmax = rr_hi),
+                           position = ggplot2::position_dodge(width = 0.5), size = 0.35) +
+  ggplot2::scale_x_log10() +
+  ggplot2::scale_colour_manual(values = c("#B2182B", "#4393C3"), name = NULL) +
+  ggplot2::labs(x = "Rate ratio (log scale)", y = NULL,
+                title = "Predictors of fire-driven and other forest loss") +
+  theme_paper +
+  ggplot2::theme(legend.direction = "vertical")
+save_fig(p4, "fig4_coefficient_plot", width = 8, height = 5.5)
+p4
+```
+
+```{r fig5-rainfall}
+if (isTRUE(cfg$use_chirps) && !is.null(rain_year) && nrow(rain_year) > 2) {
+  p5 <- ggplot2::ggplot(rain_year, ggplot2::aes(dry_z, fire_ha / 1000)) +
+    ggplot2::geom_smooth(method = "lm", se = TRUE, linewidth = 0.6, colour = "#B2182B") +
+    ggplot2::geom_point(size = 2) +
+    ggplot2::geom_text(ggplot2::aes(label = year), vjust = -0.9, size = 2.8) +
+    ggplot2::scale_y_continuous(expand = ggplot2::expansion(mult = c(0.06, 0.12))) +
+    ggplot2::labs(x = "Dry-season rainfall anomaly (z score, domain mean)",
+                  y = "Fire-driven forest loss (thousand ha)",
+                  title = "Fire-driven loss against dry-season rainfall anomaly") +
+    theme_paper
+  save_fig(p5, "fig5_rainfall_anomaly_vs_fire", width = 7, height = 5)
+  p5
+} else {
+  msg("Rainfall figure skipped: no dry-season anomaly series available.")
+}
+```
+
+# Publication maps
+
+Every map is written as a 400 dpi PNG and as a PDF, directly into
+`outputs/maps/`.
+
+```{r map-inputs}
+dom_sf <- sf::st_read(file.path(cfg$proc_dir, "study_domain.gpkg"), quiet = TRUE)
+
+# The peat fraction map is derived from the counts already computed rather
+# than from a second aggregation pass over the 30 m grid. When the raster
+# dimensions are exact multiples of the aggregation factor the two are
+# identical; otherwise the aggregation is done directly.
+if (terra::nrow(lossyear) %% agg_fact == 0 && terra::ncol(lossyear) %% agg_fact == 0) {
+  peat_coarse <- grid_counts[["n_peat"]] / npix
+} else {
+  msg("grid does not divide the raster exactly; aggregating the peat mask directly")
+  peat_coarse <- terra::aggregate(peat_bin30, agg_fact, fun = "mean")
+}
+names(peat_coarse) <- "peat_frac"
+peat_df <- terra::as.data.frame(peat_coarse, xy = TRUE, na.rm = TRUE)
+```
+
+```{r map1-study-area}
+m1 <- ggplot2::ggplot() +
+  ggplot2::geom_raster(data = peat_df, ggplot2::aes(x, y, fill = peat_frac)) +
+  ggplot2::scale_fill_gradient(low = "grey93", high = "#08519C",
+                               name = "Peat swamp\nforest fraction") +
+  ggplot2::geom_sf(data = dom_sf, fill = NA, colour = "grey20", linewidth = 0.3) +
+  ggplot2::geom_sf(data = pa, fill = NA, colour = "#238B45", linewidth = 0.3) +
+  ggplot2::coord_sf(expand = FALSE) +
+  ggplot2::labs(x = NULL, y = NULL,
+                title = "Study domain, peat swamp forest and protected areas") +
+  theme_paper
+save_map(m1, "map1_study_area")
+m1
+```
+
+```{r map2-fire-loss}
+fire_df <- dat_model |>
+  dplyr::mutate(fire_rate = 100 * fire_ha_rec / forest_ha) |>
+  dplyr::select(x, y, fire_rate)
+
+m2 <- ggplot2::ggplot() +
+  ggplot2::geom_raster(data = fire_df, ggplot2::aes(x, y, fill = pmin(fire_rate, 10))) +
+  ggplot2::scale_fill_gradientn(colours = c("grey95", "#FDD49E", "#FC8D59", "#B30000"),
+                                name = "Fire-driven loss\n(% of forest)") +
+  ggplot2::geom_sf(data = dom_sf, fill = NA, colour = "grey20", linewidth = 0.3) +
+  ggplot2::coord_sf(expand = FALSE) +
+  ggplot2::labs(x = NULL, y = NULL,
+                title = sprintf("Fire-driven forest loss, %d to %d",
+                                cfg$recent_window[1], cfg$recent_window[2])) +
+  theme_paper
+save_map(m2, "map2_fire_driven_loss_recent")
+m2
+```
+
+```{r map3-nonfire-loss}
+nonfire_df <- dat_model |>
+  dplyr::mutate(nonfire_rate = 100 * nonfire_ha_rec / forest_ha) |>
+  dplyr::select(x, y, nonfire_rate)
+
+m3 <- ggplot2::ggplot() +
+  ggplot2::geom_raster(data = nonfire_df, ggplot2::aes(x, y, fill = pmin(nonfire_rate, 10))) +
+  ggplot2::scale_fill_gradientn(colours = c("grey95", "#D0D1E6", "#74A9CF", "#023858"),
+                                name = "Other-driver loss\n(% of forest)") +
+  ggplot2::geom_sf(data = dom_sf, fill = NA, colour = "grey20", linewidth = 0.3) +
+  ggplot2::coord_sf(expand = FALSE) +
+  ggplot2::labs(x = NULL, y = NULL,
+                title = sprintf("Non-fire forest loss, %d to %d",
+                                cfg$recent_window[1], cfg$recent_window[2])) +
+  theme_paper
+save_map(m3, "map3_nonfire_loss_recent")
+m3
+```
+
+```{r map4-change}
+change_df <- dat_model |>
+  dplyr::mutate(
+    rate_rec  = fire_ha_rec / (cfg$recent_window[2] - cfg$recent_window[1] + 1) / forest_ha,
+    rate_base = fire_ha_base / (cfg$base_window[2] - cfg$base_window[1] + 1) / forest_ha,
+    delta = 100 * (rate_rec - rate_base)
+  ) |>
+  dplyr::select(x, y, delta)
+
+m4 <- ggplot2::ggplot() +
+  ggplot2::geom_raster(data = change_df,
+                       ggplot2::aes(x, y, fill = pmax(pmin(delta, 2), -2))) +
+  ggplot2::scale_fill_gradient2(low = "#2166AC", mid = "grey95", high = "#B2182B",
+                                midpoint = 0,
+                                name = "Change in annual\nfire loss rate\n(percentage points)") +
+  ggplot2::geom_sf(data = dom_sf, fill = NA, colour = "grey20", linewidth = 0.3) +
+  ggplot2::coord_sf(expand = FALSE) +
+  ggplot2::labs(x = NULL, y = NULL,
+                title = "Change in fire-driven loss rate, reference to anomaly window") +
+  theme_paper
+save_map(m4, "map4_change_in_fire_rate")
+m4
+rm(fire_df, nonfire_df, change_df, peat_df, ts_long, share_long, grad); gc()
+```
+
+# GeoTIFF exports
+
+```{r export-geotiffs}
+# base::pmax() is not defined for SpatRaster and can fail in terra's comparison
+# machinery. Build the same denominator with a terra-native raster operation.
+forest_count_r <- grid_counts[["n_forest"]]
+forest_den_r <- terra::ifel(forest_count_r < 1, 1, forest_count_r)
+
+fire_rate_r <- (grid_counts[["n_fire_rec"]] / forest_den_r) * 100
+names(fire_rate_r) <- "fire_loss_pct_of_forest_recent"
+write_tif(fire_rate_r,
+          file.path(cfg$tif_dir, "fire_loss_pct_of_forest_2023_2025.tif"))
+
+nonfire_rate_r <- (grid_counts[["n_nonfire_rec"]] / forest_den_r) * 100
+names(nonfire_rate_r) <- "nonfire_loss_pct_of_forest_recent"
+write_tif(nonfire_rate_r,
+          file.path(cfg$tif_dir, "nonfire_loss_pct_of_forest_2023_2025.tif"))
+
+write_tif(peat_coarse,
+          file.path(cfg$tif_dir, "peat_swamp_forest_fraction_grid.tif"))
+
+# The only 30 m export. Written in one streaming pass as a one-byte layer.
+fire_peat_tif <- file.path(cfg$tif_dir, "fire_on_peat_swamp_forest_2023_2025_30m.tif")
+if (!validate_geotiff(fire_peat_tif)) {
+  msg("writing the 30 m fire-on-peat export")
+  terra::lapp(c(fireyear, peat_bin30, forest30),
+              fun = function(fy, pb, fo) {
+                fy[is.na(fy)] <- 0; pb[is.na(pb)] <- 0; fo[is.na(fo)] <- 0
+                as.integer(fy >= y_lo_rec & fy <= y_hi_rec & pb == 1 & fo == 1)
+              },
+              filename = fire_peat_tif, overwrite = TRUE, wopt = wopt_int)
+  sweep_temp()
+}
+register_output(fire_peat_tif)
+rm(fire_rate_r, nonfire_rate_r, forest_count_r, forest_den_r); gc()
+msg("GeoTIFF exports complete")
+```
+
+# Stratified validation sample
+
+A design-based check on the fire attribution. Selection is uniform over the
+qualifying 30 m pixels within each stratum, implemented as
+probability-proportional-to-size selection of analysis cells followed by
+uniform selection inside the chosen cell. This reads only small windows,
+where the earlier approach would have returned hundreds of millions of cell
+indices from a single call.
+
+```{r validation-sample}
+if (isTRUE(cfg$n_validation_per_stratum > 0)) {
+gv_cells   <- terra::values(grid_counts, dataframe = TRUE)
+pix_ha_vec <- as.vector(terra::values(terra::cellSize(template, unit = "ha"))) / npix
+
+strata <- list(
+  A_fire_on_peat  = pmax(gv_cells$n_fire_peat_rec, 0),
+  B_loss_not_fire = pmax(gv_cells$n_nonfire_rec, 0),
+  C_stable_forest = pmax(gv_cells$n_forest - gv_cells$n_loss_rec, 0)
+)
+strata <- lapply(strata, function(z) { z[is.na(z)] <- 0; z })
+
+qualifies <- list(
+  A_fire_on_peat = function(L, Fy, Fo, Pe)
+    Fy >= y_lo_rec & Fy <= y_hi_rec & Fo == 1 & Pe == 1,
+  B_loss_not_fire = function(L, Fy, Fo, Pe)
+    L >= y_lo_rec & L <= y_hi_rec & Fo == 1 & !(Fy >= y_lo_rec & Fy <= y_hi_rec),
+  C_stable_forest = function(L, Fy, Fo, Pe)
+    Fo == 1 & !(L >= y_lo_rec & L <= y_hi_rec)
+)
+
+g_half <- cfg$grid_deg / 2
+
+sample_stratum <- function(label, n_target, seed) {
+  set.seed(seed)
+  wts <- strata[[label]]
+  if (sum(wts) == 0) { warning("no pixels in stratum ", label); return(NULL) }
+  qual <- qualifies[[label]]
+  pts <- list(); tries <- 0L
+  while (length(pts) < n_target && tries < n_target * 10L) {
+    tries <- tries + 1L
+    ci <- sample.int(length(wts), 1L, prob = wts)
+    xy <- terra::xyFromCell(template, ci)
+    e  <- terra::ext(xy[1] - g_half, xy[1] + g_half, xy[2] - g_half, xy[2] + g_half)
+    L  <- terra::values(terra::crop(lossyear, e))[, 1]
+    Fy <- terra::values(terra::crop(fireyear, e))[, 1]
+    Fo <- terra::values(terra::crop(forest30, e))[, 1]
+    Pe <- terra::values(terra::crop(peat_bin30, e))[, 1]
+    L[is.na(L)] <- 0; Fy[is.na(Fy)] <- 0; Fo[is.na(Fo)] <- 0; Pe[is.na(Pe)] <- 0
+    win <- terra::crop(lossyear, e)
+    ok <- which(qual(L, Fy, Fo, Pe))
+    if (!length(ok)) next
+    pick <- ok[sample.int(length(ok), 1L)]
+    p_xy <- terra::xyFromCell(win, pick)
+    pts[[length(pts) + 1L]] <- c(lon = p_xy[1], lat = p_xy[2])
+    rm(L, Fy, Fo, Pe, win)
+    if (length(pts) %% 25L == 0L) msg("stratum ", label, ": ", length(pts),
+                                      " of ", n_target, " points")
+  }
+  if (!length(pts)) return(NULL)
+  m <- do.call(rbind, pts)
+  m <- m[!duplicated(m), , drop = FALSE]
+  tibble::tibble(
+    point_id = sprintf("%s_%03d", label, seq_len(nrow(m))),
+    stratum = label,
+    lon = m[, 1], lat = m[, 2],
+    map_class = label,
+    reference_class = NA_character_,
+    imagery_source = NA_character_,
+    note = NA_character_
+  )
+}
+
+val <- dplyr::bind_rows(
+  sample_stratum("A_fire_on_peat",  cfg$n_validation_per_stratum, 101),
+  sample_stratum("B_loss_not_fire", cfg$n_validation_per_stratum, 102),
+  sample_stratum("C_stable_forest", cfg$n_validation_per_stratum, 103)
+)
+
+strat_areas <- tibble::tibble(
+  stratum = names(strata),
+  map_area_ha = vapply(strata, function(z) sum(z * pix_ha_vec, na.rm = TRUE), numeric(1))
+) |>
+  dplyr::mutate(area_weight = map_area_ha / sum(map_area_ha))
+
+write_table(val, file.path(cfg$tab_dir, "validation_points_stratified.csv"))
+write_table(strat_areas, file.path(cfg$tab_dir, "validation_stratum_area_weights.csv"))
+val_sf <- sf::st_as_sf(val, coords = c("lon", "lat"), crs = 4326, remove = FALSE)
+sf::write_sf(val_sf, file.path(cfg$out_dir, "validation_points_stratified.gpkg"),
+             delete_dsn = TRUE)
+register_output(file.path(cfg$out_dir, "validation_points_stratified.gpkg"))
+knitr::kable(strat_areas, digits = 2)
+rm(gv_cells, val_sf); gc()
+} else {
+  strat_areas <- NULL
+  msg("Validation sampling disabled by configuration.")
+}
+```
+
+```{r validation-accuracy}
+labelled_path <- file.path(cfg$manual_dir, "validation_points_labelled.csv")
+if (!exists("strat_areas") || is.null(strat_areas)) {
+  msg("Validation sampling was disabled (cfg$n_validation_per_stratum = 0), ",
+      "so no accuracy assessment is produced.")
+} else if (file.exists(labelled_path)) {
+  lab <- readr::read_csv(labelled_path, show_col_types = FALSE) |>
+    dplyr::filter(!is.na(reference_class), reference_class != "skip_uncertain")
+
+  cm <- table(map = lab$stratum, reference = lab$reference_class)
+  print(cm)
+
+  w <- strat_areas$area_weight[match(rownames(cm), strat_areas$stratum)]
+  p_hat <- sweep(prop.table(cm, 1), 1, w, "*")
+
+  acc <- tibble::tibble(
+    overall_accuracy_area_adjusted = sum(diag(p_hat)),
+    n_labelled = nrow(lab)
+  )
+  write_table(as.data.frame(cm), file.path(cfg$tab_dir, "table_S12_confusion_matrix.csv"))
+  write_table(acc, file.path(cfg$tab_dir, "table_S13_area_adjusted_accuracy.csv"))
+  knitr::kable(acc, digits = 4)
+  rm(lab, cm, p_hat, acc); gc()
+} else {
+  msg("No labelled validation file at ", labelled_path,
+      ". Interpret the exported points and return them under that name to ",
+      "produce the confusion matrix and area-adjusted estimates.")
+}
+```
+
+# Quality assurance summary
+
+```{r qa-summary}
+# minmax() gets the minimum and maximum in a single pass per layer, where
+# two separate global() calls would read each raster twice.
+mm <- function(r) {
+  v <- try(terra::minmax(r, compute = TRUE), silent = TRUE)
+  if (inherits(v, "try-error")) c(NA_real_, NA_real_) else as.vector(v[, 1])
+}
+mm_loss <- mm(lossyear); mm_fire <- mm(fireyear); mm_peat <- mm(peat30)
+mm_tc   <- if (have_treecover) mm(treecover) else c(NA_real_, NA_real_)
+
+qa <- tibble::tibble(
+  layer = c("lossyear", "fireyear", "peatclass_30m", "treecover2000", "grid_counts"),
+  path = c(loss_path, fire_path, peat30_path,
+           if (have_treecover) tc_path else NA_character_, grid_path),
+  ncell = c(terra::ncell(lossyear), terra::ncell(fireyear), terra::ncell(peat30),
+            if (have_treecover) terra::ncell(treecover) else NA_real_,
+            terra::ncell(grid_counts)),
+  min = c(mm_loss[1], mm_fire[1], mm_peat[1], mm_tc[1], NA_real_),
+  max = c(mm_loss[2], mm_fire[2], mm_peat[2], mm_tc[2], NA_real_)
+)
+write_table(qa, file.path(cfg$diag_dir, "qa_raster_summary.csv"))
+knitr::kable(qa)
+
+consistency <- annual_summary |>
+  dplyr::mutate(ok_subset = fire_ha <= loss_ha + 1e-6,
+                ok_peat_subset = fire_ha_peat <= loss_ha_peat + 1e-6)
+if (!all(consistency$ok_subset) || !all(consistency$ok_peat_subset)) {
+  bad <- consistency$year[!(consistency$ok_subset & consistency$ok_peat_subset)]
+  stop("Internal consistency failed: fire-driven loss exceeds total loss in ",
+       paste(bad, collapse = ", "), ". Delete grid_annual_counts.tif from ",
+       cfg$proc_dir, " and rerun the counting stage.")
+}
+write_table(consistency, file.path(cfg$diag_dir, "internal_consistency_checks.csv"))
+msg("Internal consistency checks passed")
+```
+
+# Reproducibility record
+
+```{r repro}
+provenance <- tibble::tibble(
+  dataset = c("Hansen Global Forest Change", "UMD fire-driven forest loss",
+              "CongoPeat simplified peat map", "WDPA", "OpenStreetMap (Geofabrik)",
+              "CHIRPS v2.0 Africa monthly", "geoBoundaries ADM1"),
+  version_or_date = c(gfc_version, "2001-2025 release, AFR annual mosaic",
+                      "simplified 100 m", format(Sys.Date()), format(Sys.Date()),
+                      if (isTRUE(cfg$use_chirps)) paste(range(cfg$chirps_years), collapse = "-") else "not used",
+                      format(Sys.Date())),
+  accessed = format(Sys.Date())
+)
+write_table(provenance, file.path(cfg$out_dir, "data_provenance.csv"))
+
+flat_cfg <- cfg[!names(cfg) %in% c("grid_deg_sens", "forest_thresh_sens", "chirps_years")]
+cfg_flat <- tibble::tibble(
+  parameter = names(unlist(flat_cfg)),
+  value = as.character(unlist(flat_cfg))
+)
+cfg_flat <- dplyr::bind_rows(
+  cfg_flat,
+  tibble::tibble(parameter = c("terra_tempdir_actual", "count_engine"),
+                 value = c(local_tmp_norm,
+                           if (block_engine_ok) "streaming block engine" else
+                             "whole-raster terra fallback"))
+)
+write_table(cfg_flat, file.path(cfg$out_dir, "run_configuration.csv"))
+
+si <- capture.output(sessionInfo())
+writeLines(si, file.path(cfg$out_dir, "session_info.txt"))
+register_output(file.path(cfg$out_dir, "session_info.txt"))
+cat(si, sep = "\n")
+```
+
+```{r final-summary}
+sweep_temp()
+
+figs <- sort(list.files(cfg$fig_dir, full.names = FALSE))
+maps <- sort(list.files(cfg$map_dir, full.names = FALSE))
+tabs <- sort(list.files(cfg$tab_dir, pattern = "\\.csv$", full.names = FALSE))
+tifs <- sort(list.files(cfg$tif_dir, pattern = "\\.tif$", full.names = FALSE))
+diag <- sort(list.files(cfg$diag_dir, full.names = FALSE))
+
+cat("\nAnalysis completed successfully.\n\n")
+cat("Tables:\n     ", file.path(cfg$tab_dir, ""), "\n", sep = "")
+cat("Figures:\n     ", file.path(cfg$fig_dir, ""), "\n", sep = "")
+cat("Maps:\n     ", file.path(cfg$map_dir, ""), "\n", sep = "")
+cat("GeoTIFFs:\n     ", file.path(cfg$tif_dir, ""), "\n", sep = "")
+cat("Diagnostics:\n     ", file.path(cfg$diag_dir, ""), "\n\n", sep = "")
+
+cat("Figures created (", length(figs), "):\n", sep = "")
+cat(paste0("  ", figs, collapse = "\n"), "\n\n", sep = "")
+cat("Maps created (", length(maps), "):\n", sep = "")
+cat(paste0("  ", maps, collapse = "\n"), "\n\n", sep = "")
+cat("GeoTIFFs created (", length(tifs), "):\n", sep = "")
+cat(paste0("  ", tifs, collapse = "\n"), "\n\n", sep = "")
+cat("Tables created: ", length(tabs), "\n", sep = "")
+cat("Diagnostic files created: ", length(diag), "\n\n", sep = "")
+
+cat("Reusable processed products kept in ", cfg$proc_dir, ":\n", sep = "")
+cat(paste0("  ", sort(list.files(cfg$proc_dir)), collapse = "\n"), "\n\n", sep = "")
+
+scratch_left <- list.files(local_tmp_norm, recursive = TRUE, full.names = TRUE)
+cat("terra scratch directory: ", local_tmp_norm, " (",
+    length(scratch_left), " files, ",
+    round(sum(file.info(scratch_left)$size, na.rm = TRUE) / 1e6), " MB).\n",
+    "These are disposable and can be deleted at any time.\n", sep = "")
+```
+
+```{r bundle}
+outputs_zip <- file.path(cfg$root_dir, "outputs_public.zip")
+old <- setwd(cfg$root_dir)
+try(utils::zip(basename(outputs_zip), files = "outputs"), silent = TRUE)
+setwd(old)
+msg("Run complete. Outputs are in ", normalizePath(cfg$out_dir, mustWork = FALSE))
+```
